@@ -250,7 +250,7 @@ def devnet_deploy(paths):
     # Optionally bring up OP Plasma.
     if DEVNET_PLASMA:
         log.info('Bringing up `dredge`, `sentinel`.')
-        run_command(['docker', 'compose', 'up', '-d', 'dredge', 'sentinel'], cwd=paths.ops_bedrock_dir, env=docker_env)
+        run_command(['docker', 'compose', 'up', '-d', 'dredge', 'dredge2', 'sentinel'], cwd=paths.ops_bedrock_dir, env=docker_env)
 
     # Fin.
     log.info('Devnet ready.')

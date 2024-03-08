@@ -166,7 +166,7 @@ services:
       OP_BATCHER_RPC_ENABLE_ADMIN: "true"
       OP_BATCHER_BATCH_TYPE: 0
       OP_BATCHER_PLASMA_ENABLED: "${PLASMA_ENABLED}"
-      OP_BATCHER_PLASMA_DA_SERVER: "http://dredge:3104"
+      OP_BATCHER_PLASMA_DA_SERVER: "http://dredge2:3104"
 
   op-challenger:
     depends_on:
@@ -210,6 +210,15 @@ services:
     ports:
       - "3104:3104"
 
+  dredge2:
+    image: quarry/dredge
+    command: >
+      dredge
+      --dir=/local-data
+      --s3-bucket="fake"
+    ports:
+      - "3105:3104"
+
   sentinel:
     image: quarry/sentinel
     volumes:
@@ -220,7 +229,7 @@ services:
       --datadir=data
       --l1-rpc-http=http://l1:8545
       --l1-rpc-ws=ws://l1:8546
-      --da-storage-uri=http://dredge:3104
+      --da-storage-uri=http://dredge2:3104
       --private-key=0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba
       --config=/rollup.json
 
