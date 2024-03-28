@@ -17,6 +17,12 @@ import "src/libraries/DisputeTypes.sol";
 ///         actions that the Guardian is authorized to take. The security council can revoke the Deputy Guardian's
 ///         authorization at any time by disabling this module.
 contract DeputyGuardianModule is ISemver {
+    /// @notice Error message for unauthorized access
+    error OnlyDeputyGuardian();
+
+    /// @notice Error message for failed transaction execution
+    error TransactionExecutionFailed(string);
+
     /// @notice Emitted when the SuperchainConfig is paused
     event SuperchainConfigPaused();
 
@@ -68,7 +74,9 @@ contract DeputyGuardianModule is ISemver {
     }
 
     function _onlyDeputyGuardian() internal view {
-        require(msg.sender == DEPUTY_GUARDIAN, "DeputyGuardianModule: Only the deputy guardian can call this function.");
+        if (msg.sender != DEPUTY_GUARDIAN) {
+            revert OnlyDeputyGuardian();
+        }
     }
 
     /// @notice Calls the Security Council Safe's `execTransactionFromModuleReturnData()`, with the arguments
@@ -80,7 +88,9 @@ contract DeputyGuardianModule is ISemver {
 
         (bool success, bytes memory returnData) =
             SAFE.execTransactionFromModuleReturnData(address(SUPERCHAIN_CONFIG), 0, data, Enum.Operation.Call);
-        require(success, string(returnData));
+        if (!success) {
+            revert TransactionExecutionFailed(string(returnData));
+        }
         emit SuperchainConfigPaused();
     }
 
@@ -93,7 +103,9 @@ contract DeputyGuardianModule is ISemver {
 
         (bool success, bytes memory returnData) =
             SAFE.execTransactionFromModuleReturnData(address(SUPERCHAIN_CONFIG), 0, data, Enum.Operation.Call);
-        require(success, string(returnData));
+        if (!success) {
+            revert TransactionExecutionFailed(string(returnData));
+        }
         emit SuperchainConfigUnpaused();
     }
 
@@ -108,7 +120,9 @@ contract DeputyGuardianModule is ISemver {
 
         (bool success, bytes memory returnData) =
             SAFE.execTransactionFromModuleReturnData(address(_portal), 0, data, Enum.Operation.Call);
-        require(success, string(returnData));
+        if (!success) {
+            revert TransactionExecutionFailed(string(returnData));
+        }
         emit DisputeGameBlacklisted(_game);
     }
 
@@ -122,7 +136,9 @@ contract DeputyGuardianModule is ISemver {
         bytes memory data = abi.encodeCall(OptimismPortal2.setRespectedGameType, (_gameType));
         (bool success, bytes memory returnData) =
             SAFE.execTransactionFromModuleReturnData(address(_portal), 0, data, Enum.Operation.Call);
-        require(success, string(returnData));
+        if (!success) {
+            revert TransactionExecutionFailed(string(returnData));
+        }
         emit RespectedGameTypeSet(_gameType);
     }
 }
