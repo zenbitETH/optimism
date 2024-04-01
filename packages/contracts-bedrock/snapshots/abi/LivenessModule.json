@@ -163,5 +163,34 @@
     ],
     "stateMutability": "view",
     "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [],
+    "name": "FallbackOwnerTakesOwnership",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnerRemoved",
+    "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "InsufficientLiveness",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InsufficientOwners",
+    "type": "error"
   }
 ]
