@@ -174,19 +174,14 @@
     "anonymous": false,
     "inputs": [
       {
-        "indexed": false,
+        "indexed": true,
         "internalType": "address",
         "name": "owner",
         "type": "address"
       }
     ],
-    "name": "OwnerRemoved",
+    "name": "RemovedOwner",
     "type": "event"
-  },
-  {
-    "inputs": [],
-    "name": "InsufficientLiveness",
-    "type": "error"
   },
   {
     "inputs": [],

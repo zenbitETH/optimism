@@ -18,7 +18,7 @@ contract LivenessModule is ISemver {
     error InsufficientOwners();
 
     /// @notice Emitted when an owner is removed due to insufficient liveness
-    event OwnerRemoved(address owner);
+    event RemovedOwner(address indexed owner);
 
     /// @notice Emitted when the fallback owner takes ownership
     event FallbackOwnerTakesOwnership();
@@ -204,7 +204,7 @@ contract LivenessModule is ISemver {
             }),
             "LivenessModule: failed to remove owner"
         );
-        emit OwnerRemoved(_owner);
+        emit RemovedOwner(_owner);
     }
 
     /// @notice A FREI-PI invariant check enforcing requirements on number of owners and threshold.
