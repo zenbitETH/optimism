@@ -40,6 +40,7 @@ type inMemoryGraph struct {
 	nodes      map[NodeID]*Node
 	edges      map[string]*Edge
 	nodesByPos map[string]*Node
+	operations map[string]Operation
 	rootNode   *Node
 	leafNodes  []*Node
 	mu         sync.RWMutex
@@ -51,6 +52,7 @@ func newInMemoryGraph() *inMemoryGraph {
 		nodes:      make(map[NodeID]*Node),
 		edges:      make(map[string]*Edge),
 		nodesByPos: make(map[string]*Node),
+		operations: make(map[string]Operation),
 	}
 }
 
@@ -376,6 +378,53 @@ func (g *inMemoryGraph) GetEdgeCount(ctx context.Context) (uint64, error) {
 	defer g.mu.RUnlock()
 
 	return uint64(len(g.edges)), nil
+}
+
+// AddOperation implements the ComputationGraph interface
+func (g *inMemoryGraph) AddOperation(ctx context.Context, op Operation) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Validate the operation
+	if op.ID() == "" {
+		return fmt.Errorf("%w: operation ID cannot be empty", ErrInvalidOperation)
+	}
+
+	// Check if the operation already exists
+	if _, exists := g.operations[op.ID()]; exists {
+		return fmt.Errorf("%w: operation with ID %s already exists", ErrInvalidOperation, op.ID())
+	}
+
+	// Add the operation to the map
+	g.operations[op.ID()] = op
+
+	return nil
+}
+
+// GetOperations implements the ComputationGraph interface
+func (g *inMemoryGraph) GetOperations(ctx context.Context) ([]Operation, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	operations := make([]Operation, 0, len(g.operations))
+	for _, op := range g.operations {
+		operations = append(operations, op)
+	}
+
+	return operations, nil
+}
+
+// GetOperationByID implements the ComputationGraph interface
+func (g *inMemoryGraph) GetOperationByID(ctx context.Context, id string) (Operation, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	op, exists := g.operations[id]
+	if !exists {
+		return nil, fmt.Errorf("%w: operation with ID %s not found", ErrInvalidOperation, id)
+	}
+
+	return op, nil
 }
 
 // Ensure inMemoryGraph implements ComputationGraph
