@@ -122,7 +122,7 @@ func (p Position) RightOf(parent Position) bool {
 }
 
 // parent return a new position that is the parent of this Position.
-func (p Position) parent() Position {
+func (p Position) Parent() Position {
 	return Position{
 		depth:        p.depth - 1,
 		indexAtDepth: p.parentIndexAtDepth(),
@@ -136,7 +136,7 @@ func (p Position) Attack() Position {
 
 // Defend creates a new position which is the defend position of this one.
 func (p Position) Defend() Position {
-	return p.parent().move(true).move(false)
+	return p.Parent().move(true).move(false)
 }
 
 func (p Position) Print(maxDepth Depth) {
