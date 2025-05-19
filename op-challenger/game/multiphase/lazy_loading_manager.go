@@ -1,6 +1,7 @@
 package multiphase
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/contracts"
+	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
+	"github.com/ethereum-optimism/optimism/op-service/sources/batching"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -17,10 +23,17 @@ var (
 	ErrCacheCapacityLimit = errors.New("cache capacity limit reached")
 )
 
+// cacheItem represents an item in the LRU cache
+type cacheItem struct {
+	key   string
+	value []byte
+}
+
 // LazyLoadingManager optimizes memory usage during dispute resolution
 type LazyLoadingManager struct {
 	client       *ethclient.Client
-	stateCache   map[string][]byte
+	stateCache   map[string]*list.Element // Maps keys to list elements
+	lruList      *list.List               // Tracks LRU order
 	cacheMutex   sync.RWMutex
 	maxCacheSize int
 	cacheHits    int
@@ -33,7 +46,8 @@ type LazyLoadingManager struct {
 func NewLazyLoadingManager(client *ethclient.Client) *LazyLoadingManager {
 	return &LazyLoadingManager{
 		client:       client,
-		stateCache:   make(map[string][]byte),
+		stateCache:   make(map[string]*list.Element),
+		lruList:      list.New(),
 		maxCacheSize: 1000, // Configurable based on memory constraints
 		lastEviction: time.Now(),
 	}
@@ -50,9 +64,18 @@ func (m *LazyLoadingManager) LoadState(
 
 	// Try to get from cache first
 	m.cacheMutex.RLock()
-	if state, exists := m.stateCache[cacheKey]; exists {
-		m.cacheHits++
+	if element, exists := m.stateCache[cacheKey]; exists {
+		// Move to front of list to mark as most recently used
 		m.cacheMutex.RUnlock()
+
+		// Need write lock to modify the list
+		m.cacheMutex.Lock()
+		m.lruList.MoveToFront(element)
+		item := element.Value.(*cacheItem)
+		state := item.value
+		m.cacheHits++
+		m.cacheMutex.Unlock()
+
 		return state, nil
 	}
 	m.cacheMisses++
@@ -73,7 +96,13 @@ func (m *LazyLoadingManager) LoadState(
 		m.evictCacheEntries()
 	}
 
-	m.stateCache[cacheKey] = state
+	// Add to cache and LRU list
+	item := &cacheItem{
+		key:   cacheKey,
+		value: state,
+	}
+	element := m.lruList.PushFront(item)
+	m.stateCache[cacheKey] = element
 	m.loadCount++
 
 	return state, nil
@@ -85,39 +114,70 @@ func (m *LazyLoadingManager) fetchStateFromOracle(
 	disputeID *big.Int,
 	index *big.Int,
 ) ([]byte, error) {
-	// In a real implementation, this would:
-	// 1. Compute the preimage key for the state at the given index
-	// 2. Call the PreimageOracle to get the state
-	// 3. Process and return the state data
+	// 1. Create a connection to the dispute game contract
+	gameAddr := common.HexToAddress(disputeID.String())
 
-	// For demonstration, we'll return dummy data
-	// In production, this would call the actual PreimageOracle
-	return []byte{}, nil
-}
+	// 2. Create a batching caller for efficient RPC calls
+	caller := batching.NewMultiCaller(m.client, batching.DefaultBatchSize)
 
-// evictCacheEntries evicts entries from the cache using an LRU strategy
-func (m *LazyLoadingManager) evictCacheEntries() {
-	// Simple eviction strategy: clear half the cache
-	// A real implementation would use a proper LRU algorithm
-
-	// Keep track of half the entries to remove
-	entriesToRemove := len(m.stateCache) / 2
-	keysToRemove := make([]string, 0, entriesToRemove)
-
-	// Select entries to remove
-	i := 0
-	for key := range m.stateCache {
-		if i < entriesToRemove {
-			keysToRemove = append(keysToRemove, key)
-			i++
-		} else {
-			break
-		}
+	// 3. Create a contract instance for the dispute game
+	gameContract, err := contracts.NewFaultDisputeGameContract(ctx, nil, gameAddr, caller)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create game contract: %w", err)
 	}
 
-	// Remove selected entries
-	for _, key := range keysToRemove {
-		delete(m.stateCache, key)
+	// 4. Get the PreimageOracle from the game contract
+	oracle, err := gameContract.GetOracle(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get oracle: %w", err)
+	}
+
+	// 5. Compute the preimage key for the state at the given index
+	// The key format depends on the specific implementation, but typically includes the index
+	// We'll use a simple key derivation based on the dispute ID and index
+	keyBytes := append(disputeID.Bytes(), index.Bytes()...)
+	key := crypto.Keccak256(keyBytes)
+
+	// 6. Create the PreimageOracleData structure
+	oracleData := types.NewPreimageOracleData(key, nil, 0)
+
+	// 7. Check if the data exists in the oracle
+	exists, err := oracle.GlobalDataExists(ctx, oracleData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if data exists: %w", err)
+	}
+
+	if !exists {
+		return nil, ErrStateNotFound
+	}
+
+	// 8. Get the state data from the oracle
+	stateBytes, err := oracle.GetGlobalData(ctx, oracleData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get state data: %w", err)
+	}
+
+	// 9. Return the state data
+	return stateBytes[:], nil
+}
+
+// evictCacheEntries evicts entries from the cache using an LRU algorithm
+func (m *LazyLoadingManager) evictCacheEntries() {
+	// Proper LRU eviction: remove the least recently used item
+	// which is at the back of the list
+	if m.lruList.Len() == 0 {
+		return // Nothing to evict
+	}
+
+	// Get the least recently used element
+	element := m.lruList.Back()
+	if element != nil {
+		// Remove from the list
+		m.lruList.Remove(element)
+
+		// Get the item and remove from the map
+		item := element.Value.(*cacheItem)
+		delete(m.stateCache, item.key)
 	}
 
 	m.lastEviction = time.Now()

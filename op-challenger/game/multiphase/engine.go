@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
@@ -224,10 +226,37 @@ func (e *MultiPhaseEngine) getDisputeDetails(ctx context.Context, disputeID *big
 }
 
 func (e *MultiPhaseEngine) getTransactionOpts(ctx context.Context) (*bind.TransactOpts, error) {
-	// This would be implemented based on the authentication method used
-	// For example, using a private key or hardware wallet
-	// For this example, we'll leave it as a placeholder
-	return nil, nil
+	// Get the signer's private key from the environment or configuration
+	// In a real implementation, this would be securely managed
+	privateKey, err := crypto.HexToECDSA(os.Getenv("CHALLENGER_PRIVATE_KEY"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	// Get the chain ID from the client
+	chainID, err := e.client.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get chain ID: %w", err)
+	}
+
+	// Create a new transactor with the private key and chain ID
+	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create transactor: %w", err)
+	}
+
+	// Set gas parameters
+	auth.Context = ctx
+	auth.GasLimit = 3000000 // Set an appropriate gas limit
+
+	// For EIP-1559 compatible chains
+	auth.GasFeeCap = big.NewInt(21000000000) // 21 gwei
+	auth.GasTipCap = big.NewInt(1000000000)  // 1 gwei
+
+	// For non-EIP-1559 chains, you might use GasPrice instead
+	// auth.GasPrice = big.NewInt(20000000000) // 20 gwei
+
+	return auth, nil
 }
 
 // DisputeDetails represents the details of a dispute
