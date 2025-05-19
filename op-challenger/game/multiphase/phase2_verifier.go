@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
 
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/cannon"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/trace/utils"
@@ -29,6 +30,7 @@ var (
 type Phase2Verifier struct {
 	client             *ethclient.Client
 	lazyLoadingManager *LazyLoadingManager
+	logger             log.Logger
 }
 
 // NewPhase2Verifier creates a new instance of Phase2Verifier
@@ -36,6 +38,7 @@ func NewPhase2Verifier(client *ethclient.Client, llm *LazyLoadingManager) *Phase
 	return &Phase2Verifier{
 		client:             client,
 		lazyLoadingManager: llm,
+		logger:             log.New("component", "Phase2Verifier"),
 	}
 }
 
@@ -51,15 +54,24 @@ func (v *Phase2Verifier) VerifyAndFindFault(
 	currentStart := new(big.Int).Set(segmentStart)
 	currentEnd := new(big.Int).Set(segmentEnd)
 
+	v.logger.Info("Starting fault verification",
+		"disputeID", disputeID,
+		"segmentStart", segmentStart,
+		"segmentEnd", segmentEnd,
+		"segmentStateRoot", segmentStateRoot.Hex())
+
 	for currentStart.Cmp(currentEnd) < 0 {
 		// If we're down to one instruction, verify it
 		if new(big.Int).Sub(currentEnd, currentStart).Cmp(big.NewInt(1)) <= 0 {
+			v.logger.Info("Found fault at instruction", "index", currentStart)
 			return currentStart, v.generateWitness(ctx, disputeID, currentStart)
 		}
 
 		// Find midpoint
 		midpoint := new(big.Int).Add(currentStart, currentEnd)
 		midpoint.Div(midpoint, big.NewInt(2))
+
+		v.logger.Debug("Checking midpoint", "midpoint", midpoint)
 
 		// Load state at midpoint
 		midStateRootBytes, err := v.lazyLoadingManager.LoadState(ctx, disputeID, midpoint)
@@ -85,9 +97,11 @@ func (v *Phase2Verifier) VerifyAndFindFault(
 		// Determine which half contains the fault
 		if !valid {
 			// Fault is in the first half
+			v.logger.Debug("Fault found in first half", "start", currentStart, "end", midpoint)
 			currentEnd = midpoint
 		} else {
 			// Fault is in the second half
+			v.logger.Debug("Fault found in second half", "start", midpoint, "end", currentEnd)
 			currentStart = midpoint
 		}
 	}
@@ -111,6 +125,8 @@ func (v *Phase2Verifier) VerifyInstructionExecution(
 	}
 	defer os.RemoveAll(tempDir)
 
+	v.logger.Debug("Created temporary directory for verification", "dir", tempDir)
+
 	// Load the state at the start index
 	startStateBytes, err := v.lazyLoadingManager.LoadState(ctx, disputeID, startIndex)
 	if err != nil {
@@ -124,15 +140,19 @@ func (v *Phase2Verifier) VerifyInstructionExecution(
 	}
 
 	// Create a Cannon executor to run the instructions
-	// We need to get the configuration for the executor
 	vmConfig := vm.Config{
+		// VM Configuration
 		VmType:          types.TraceTypeCannon,
-		VmBin:           "cannon",     // Path to cannon binary
-		SnapshotFreq:    1000,         // Snapshot frequency
-		InfoFreq:        1000,         // Info frequency
-		DebugInfo:       true,         // Enable debug info
-		BinarySnapshots: true,         // Use binary snapshots
-		Server:          "op-program", // Path to op-program binary
+		VmBin:           "/usr/local/bin/cannon", // Path to cannon binary
+		SnapshotFreq:    1000,                    // Snapshot frequency
+		InfoFreq:        1000,                    // Info frequency
+		DebugInfo:       true,                    // Enable debug info
+		BinarySnapshots: true,                    // Use binary snapshots
+
+		// Host Configuration
+		Server:   "/usr/local/bin/op-program", // Path to op-program binary
+		L1:       "http://localhost:8545",     // Default L1 RPC URL
+		Networks: []string{"optimism-goerli"}, // Default network
 	}
 
 	// Create local game inputs
@@ -145,10 +165,12 @@ func (v *Phase2Verifier) VerifyInstructionExecution(
 	}
 
 	// Create the executor
-	logger := log.New()
+	logger := log.New("component", "CannonExecutor")
 	metricer := metrics.NoopMetrics.ToTypedVmMetrics("cannon")
 	oracleServer := vm.NewOpProgramServerExecutor(logger)
 	executor := vm.NewExecutor(logger, metricer, vmConfig, oracleServer, "", localInputs)
+
+	v.logger.Debug("Executing instructions", "start", startIndex, "end", endIndex)
 
 	// Execute the instructions from start to end
 	if err := executor.DoGenerateProof(ctx, tempDir, startIndex.Uint64(), endIndex.Uint64()); err != nil {
@@ -161,6 +183,10 @@ func (v *Phase2Verifier) VerifyInstructionExecution(
 	if err != nil {
 		return false, fmt.Errorf("failed to convert state to proof: %w", err)
 	}
+
+	v.logger.Debug("Verification completed",
+		"expectedRoot", expectedEndStateRoot.Hex(),
+		"actualRoot", proof.ClaimValue.Hex())
 
 	// Compare the resulting state root with the expected one
 	if proof.ClaimValue != expectedEndStateRoot {
@@ -183,6 +209,8 @@ func (v *Phase2Verifier) generateWitness(
 	}
 	defer os.RemoveAll(tempDir)
 
+	v.logger.Info("Generating witness for instruction", "index", instructionIndex, "dir", tempDir)
+
 	// Load the state at the instruction index
 	stateBytes, err := v.lazyLoadingManager.LoadState(ctx, disputeID, instructionIndex)
 	if err != nil {
@@ -191,21 +219,24 @@ func (v *Phase2Verifier) generateWitness(
 
 	// Create a Cannon executor configuration
 	vmConfig := vm.Config{
+		// VM Configuration
 		VmType:          types.TraceTypeCannon,
-		VmBin:           "cannon",     // Path to cannon binary
-		SnapshotFreq:    1000,         // Snapshot frequency
-		InfoFreq:        1000,         // Info frequency
-		DebugInfo:       true,         // Enable debug info
-		BinarySnapshots: true,         // Use binary snapshots
-		Server:          "op-program", // Path to op-program binary
+		VmBin:           "/usr/local/bin/cannon", // Path to cannon binary
+		SnapshotFreq:    1000,                    // Snapshot frequency
+		InfoFreq:        1000,                    // Info frequency
+		DebugInfo:       true,                    // Enable debug info
+		BinarySnapshots: true,                    // Use binary snapshots
+
+		// Host Configuration
+		Server:   "/usr/local/bin/op-program", // Path to op-program binary
+		L1:       "http://localhost:8545",     // Default L1 RPC URL
+		Networks: []string{"optimism-goerli"}, // Default network
 	}
 
 	// Create the state converter
 	stateConverter := cannon.NewStateConverter(vmConfig)
 
-	// Generate the witness data
-	// We need to execute the instruction and capture the state before and after
-	// First, we'll execute up to the instruction index
+	// Create local game inputs
 	localInputs := utils.LocalGameInputs{
 		L1Head:           common.Hash{},
 		L2Head:           common.Hash{},
@@ -215,21 +246,35 @@ func (v *Phase2Verifier) generateWitness(
 	}
 
 	// Create the executor
-	logger := log.New()
+	logger := log.New("component", "CannonExecutor")
 	metricer := metrics.NoopMetrics.ToTypedVmMetrics("cannon")
 	oracleServer := vm.NewOpProgramServerExecutor(logger)
 	executor := vm.NewExecutor(logger, metricer, vmConfig, oracleServer, "", localInputs)
 
-	// Execute the instruction
+	// Create necessary directories
+	if err := os.MkdirAll(filepath.Join(tempDir, vm.SnapsDir), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create snapshot directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(tempDir, vm.PreimagesDir), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create preimages directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(tempDir, utils.ProofsDir), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create proofs directory: %w", err)
+	}
+
+	// Execute the instruction and generate the witness
+	v.logger.Debug("Executing instruction to generate witness", "index", instructionIndex)
 	if err := executor.GenerateProof(ctx, tempDir, instructionIndex.Uint64()); err != nil {
 		return nil, fmt.Errorf("failed to execute instruction: %w", err)
 	}
 
 	// Get the proof data
-	proof, _, _, err := stateConverter.ConvertStateToProof(ctx, vm.FinalStatePath(tempDir, vmConfig.BinarySnapshots))
+	proof, step, exited, err := stateConverter.ConvertStateToProof(ctx, vm.FinalStatePath(tempDir, vmConfig.BinarySnapshots))
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert state to proof: %w", err)
 	}
+
+	v.logger.Info("Generated witness", "step", step, "exited", exited)
 
 	// Create the witness data structure
 	witnessData := struct {
@@ -240,6 +285,8 @@ func (v *Phase2Verifier) generateWitness(
 		OracleKey        hexutil.Bytes `json:"oracleKey,omitempty"`
 		OracleValue      hexutil.Bytes `json:"oracleValue,omitempty"`
 		OracleOffset     uint32        `json:"oracleOffset,omitempty"`
+		Step             uint64        `json:"step"`
+		Exited           bool          `json:"exited"`
 	}{
 		InstructionIndex: instructionIndex,
 		StateRoot:        proof.ClaimValue,
@@ -248,6 +295,8 @@ func (v *Phase2Verifier) generateWitness(
 		OracleKey:        proof.OracleKey,
 		OracleValue:      proof.OracleValue,
 		OracleOffset:     proof.OracleOffset,
+		Step:             step,
+		Exited:           exited,
 	}
 
 	// Serialize the witness data to JSON

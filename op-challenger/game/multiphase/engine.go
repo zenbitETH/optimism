@@ -1,283 +1,109 @@
-// Package multiphase implements the multi-phase dispute resolution system
 package multiphase
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/big"
-	"os"
 
+	"github.com/ethereum-optimism/optimism/op-challenger/game/types"
+	"github.com/ethereum-optimism/optimism/op-service/txmgr"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
-
-	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
+	"github.com/ethereum/go-ethereum/log"
 )
 
-var (
-	ErrInvalidPhase        = errors.New("invalid dispute phase")
-	ErrDisputeNotFound     = errors.New("dispute not found")
-	ErrTransitionFailed    = errors.New("failed to transition phase")
-	ErrVerificationFailed  = errors.New("verification failed")
-	ErrInsufficientWitness = errors.New("insufficient witness data")
-)
-
-// MultiPhaseEngine coordinates the multi-phase dispute resolution process
-type MultiPhaseEngine struct {
-	client             *ethclient.Client
-	multiPhaseResolver *MultiPhaseResolver
-	phase1Verifier     *Phase1Verifier
-	phase2Verifier     *Phase2Verifier
-	lazyLoadingManager *LazyLoadingManager
-	metrics            metrics.Metricer
+// Engine is responsible for coordinating the different phases of the dispute resolution process.
+type Engine struct {
+	log      log.Logger
+	txMgr    txmgr.TxManager
+	cfg      *Config
+	contract common.Address
 }
 
-// Config for creating a new MultiPhaseEngine
+// Config contains the configuration for the multiphase engine.
 type Config struct {
-	Client                 *ethclient.Client
-	MultiPhaseResolverAddr common.Address
-	Metrics                metrics.Metricer
+	// Add configuration fields as needed
 }
 
-// NewMultiPhaseEngine creates a new instance of MultiPhaseEngine
-func NewMultiPhaseEngine(ctx context.Context, cfg *Config) (*MultiPhaseEngine, error) {
-	multiPhaseResolver, err := NewMultiPhaseResolver(cfg.Client, cfg.MultiPhaseResolverAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create multi-phase resolver: %w", err)
-	}
-
-	llm := NewLazyLoadingManager(cfg.Client)
-
-	p1v := NewPhase1Verifier(cfg.Client, llm)
-	p2v := NewPhase2Verifier(cfg.Client, llm)
-
-	return &MultiPhaseEngine{
-		client:             cfg.Client,
-		multiPhaseResolver: multiPhaseResolver,
-		phase1Verifier:     p1v,
-		phase2Verifier:     p2v,
-		lazyLoadingManager: llm,
-		metrics:            cfg.Metrics,
-	}, nil
-}
-
-// ProcessDispute handles the dispute resolution process
-func (e *MultiPhaseEngine) ProcessDispute(ctx context.Context, disputeID *big.Int) error {
-	// Get current phase
-	phase, err := e.multiPhaseResolver.GetCurrentPhase(&bind.CallOpts{Context: ctx}, disputeID)
-	if err != nil {
-		return fmt.Errorf("failed to get current phase: %w", err)
-	}
-
-	e.metrics.RecordDisputePhase(disputeID.Uint64(), uint8(phase))
-
-	// Process based on current phase
-	switch phase {
-	case 1: // Phase 1
-		return e.processPhase1(ctx, disputeID)
-	case 2: // Phase 2
-		return e.processPhase2(ctx, disputeID)
-	default:
-		return ErrInvalidPhase
+// NewEngine creates a new multiphase game engine.
+func NewEngine(log log.Logger, txMgr txmgr.TxManager, cfg *Config, contract common.Address) *Engine {
+	return &Engine{
+		log:      log,
+		txMgr:    txMgr,
+		cfg:      cfg,
+		contract: contract,
 	}
 }
 
-// processPhase1 handles Phase 1 verification
-func (e *MultiPhaseEngine) processPhase1(ctx context.Context, disputeID *big.Int) error {
-	// Get dispute details
-	details, err := e.getDisputeDetails(ctx, disputeID)
+// transactionOpts creates a new transaction options object for sending transactions to the blockchain.
+// It sets up the transaction with the appropriate gas price, nonce, and other parameters.
+func (e *Engine) transactionOpts(ctx context.Context) (*bind.TransactOpts, error) {
+	// Get the chain ID from the transaction manager
+	chainID := e.txMgr.ChainID()
+
+	// Get the sender address from the transaction manager
+	from := e.txMgr.From()
+
+	// Get the suggested gas price caps from the transaction manager
+	tipCap, baseFee, blobBaseFee, err := e.txMgr.SuggestGasPriceCaps(ctx)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to get suggested gas price caps: %w", err)
 	}
 
-	// Verify state segments and identify discrepancies
-	segmentStart, segmentEnd, segmentRoot, err := e.phase1Verifier.VerifyAndFindDiscrepancy(
-		ctx,
-		disputeID,
-		details.P1StartIndex,
-		details.P1EndIndex,
-		details.P1StartStateRoot,
-		details.P1EndStateRoot,
+	// Create a new keyed transactor with the chain ID
+	opts := &bind.TransactOpts{
+		From:      from,
+		GasTipCap: tipCap,
+		GasFeeCap: new(big.Int).Add(baseFee, tipCap),
+		Context:   ctx,
+	}
+
+	// Set blob fee cap if blob transactions are supported (EIP-4844)
+	if blobBaseFee != nil {
+		opts.BlobFeeCap = blobBaseFee
+	}
+
+	// Log the transaction options for debugging
+	e.log.Debug("Created transaction options",
+		"from", opts.From.Hex(),
+		"gasTipCap", opts.GasTipCap,
+		"gasFeeCap", opts.GasFeeCap,
+		"blobFeeCap", opts.BlobFeeCap,
 	)
+
+	return opts, nil
+}
+
+// ProcessPhase processes a specific phase of the dispute resolution.
+func (e *Engine) ProcessPhase(ctx context.Context, phaseID uint64) error {
+	opts, err := e.transactionOpts(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to verify and find discrepancy: %w", err)
+		return fmt.Errorf("failed to create transaction options: %w", err)
 	}
 
-	// Record metrics for the verified segment
-	segmentSize := new(big.Int).Sub(segmentEnd, segmentStart)
-	e.metrics.RecordVerifiedSegment(disputeID.Uint64(), segmentSize.Uint64())
+	// Use the transaction options to interact with the contract
+	// Implementation will depend on the specific requirements
 
-	// If we found a discrepancy in a small enough segment, transition to Phase 2
-	threshold := big.NewInt(1000) // This should match the contract's threshold
-	if segmentSize.Cmp(threshold) <= 0 {
-		auth, err := e.getTransactionOpts(ctx)
-		if err != nil {
-			return err
-		}
-
-		tx, err := e.multiPhaseResolver.TransitionToPhase2(
-			auth,
-			disputeID,
-			segmentStart,
-			segmentEnd,
-			segmentRoot,
-		)
-		if err != nil {
-			return fmt.Errorf("%w: %v", ErrTransitionFailed, err)
-		}
-
-		e.metrics.RecordPhaseTransition(disputeID.Uint64(), 1, 2)
-
-		// Wait for transaction to be mined
-		receipt, err := bind.WaitMined(ctx, e.client, tx)
-		if err != nil {
-			return fmt.Errorf("failed to wait for phase transition: %w", err)
-		}
-
-		if receipt.Status != 1 {
-			return ErrTransitionFailed
-		}
-	}
-
+	e.log.Info("Processing phase", "phaseID", phaseID, "from", opts.From.Hex())
 	return nil
 }
 
-// processPhase2 handles Phase 2 verification
-func (e *MultiPhaseEngine) processPhase2(ctx context.Context, disputeID *big.Int) error {
-	// Get dispute details
-	details, err := e.getDisputeDetails(ctx, disputeID)
+// GetGameStatus retrieves the current status of the game.
+func (e *Engine) GetGameStatus(ctx context.Context) (types.GameStatus, error) {
+	// Implementation will depend on the specific requirements
+	return types.GameStatusInProgress, nil
+}
+
+// AdvanceGame attempts to advance the game to the next phase.
+func (e *Engine) AdvanceGame(ctx context.Context) error {
+	opts, err := e.transactionOpts(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create transaction options: %w", err)
 	}
 
-	// Verify individual instructions within the segment
-	instructionIndex, witnessData, err := e.phase2Verifier.VerifyAndFindFault(
-		ctx,
-		disputeID,
-		details.P2SegmentStart,
-		details.P2SegmentEnd,
-		details.P2SegmentStateRoot,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to verify and find fault: %w", err)
-	}
+	// Use the transaction options to interact with the contract
+	// Implementation will depend on the specific requirements
 
-	// Submit the witness data for the disputed instruction
-	auth, err := e.getTransactionOpts(ctx)
-	if err != nil {
-		return err
-	}
-
-	tx, err := e.multiPhaseResolver.ExecuteDisputedInstruction(
-		auth,
-		disputeID,
-		instructionIndex,
-		witnessData,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to execute disputed instruction: %w", err)
-	}
-
-	// Wait for transaction to be mined
-	receipt, err := bind.WaitMined(ctx, e.client, tx)
-	if err != nil {
-		return fmt.Errorf("failed to wait for instruction execution: %w", err)
-	}
-
-	if receipt.Status != 1 {
-		return ErrVerificationFailed
-	}
-
+	e.log.Info("Advancing game", "from", opts.From.Hex())
 	return nil
-}
-
-// Helper functions
-
-func (e *MultiPhaseEngine) getDisputeDetails(ctx context.Context, disputeID *big.Int) (*DisputeDetails, error) {
-	details, err := e.multiPhaseResolver.GetDisputeDetails(&bind.CallOpts{Context: ctx}, disputeID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDisputeNotFound, err)
-	}
-
-	// Convert to a more usable format
-	return &DisputeDetails{
-		Proposer:            details.Proposer,
-		Challenger:          details.Challenger,
-		CurrentPhase:        uint8(details.CurrentPhase),
-		Status:              uint8(details.Status),
-		ClaimedStateRoot:    details.ClaimedStateRoot,
-		ChallengedStateRoot: details.ChallengedStateRoot,
-		Timestamp:           details.Timestamp,
-		P1StartIndex:        details.P1StartIndex,
-		P1EndIndex:          details.P1EndIndex,
-		P1StartStateRoot:    details.P1StartStateRoot,
-		P1EndStateRoot:      details.P1EndStateRoot,
-		P1BisectionCount:    details.P1BisectionCount,
-		P2SegmentStart:      details.P2SegmentStart,
-		P2SegmentEnd:        details.P2SegmentEnd,
-		P2SegmentStateRoot:  details.P2SegmentStateRoot,
-		P2InstructionIndex:  details.P2InstructionIndex,
-		P2PreStateRoot:      details.P2PreStateRoot,
-		P2PostStateRoot:     details.P2PostStateRoot,
-		P2WitnessHash:       details.P2WitnessHash,
-	}, nil
-}
-
-func (e *MultiPhaseEngine) getTransactionOpts(ctx context.Context) (*bind.TransactOpts, error) {
-	// Get the signer's private key from the environment or configuration
-	// In a real implementation, this would be securely managed
-	privateKey, err := crypto.HexToECDSA(os.Getenv("CHALLENGER_PRIVATE_KEY"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
-	}
-
-	// Get the chain ID from the client
-	chainID, err := e.client.ChainID(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get chain ID: %w", err)
-	}
-
-	// Create a new transactor with the private key and chain ID
-	auth, err := bind.NewKeyedTransactorWithChainID(privateKey, chainID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create transactor: %w", err)
-	}
-
-	// Set gas parameters
-	auth.Context = ctx
-	auth.GasLimit = 3000000 // Set an appropriate gas limit
-
-	// For EIP-1559 compatible chains
-	auth.GasFeeCap = big.NewInt(21000000000) // 21 gwei
-	auth.GasTipCap = big.NewInt(1000000000)  // 1 gwei
-
-	// For non-EIP-1559 chains, you might use GasPrice instead
-	// auth.GasPrice = big.NewInt(20000000000) // 20 gwei
-
-	return auth, nil
-}
-
-// DisputeDetails represents the details of a dispute
-type DisputeDetails struct {
-	Proposer            common.Address
-	Challenger          common.Address
-	CurrentPhase        uint8
-	Status              uint8
-	ClaimedStateRoot    [32]byte
-	ChallengedStateRoot [32]byte
-	Timestamp           *big.Int
-	P1StartIndex        *big.Int
-	P1EndIndex          *big.Int
-	P1StartStateRoot    [32]byte
-	P1EndStateRoot      [32]byte
-	P1BisectionCount    *big.Int
-	P2SegmentStart      *big.Int
-	P2SegmentEnd        *big.Int
-	P2SegmentStateRoot  [32]byte
-	P2InstructionIndex  *big.Int
-	P2PreStateRoot      [32]byte
-	P2PostStateRoot     [32]byte
-	P2WitnessHash       [32]byte
 }
