@@ -7,14 +7,13 @@ import { ITournamentGame } from "../../interfaces/dispute/ITournamentGame.sol";
 import { TournamentFactory } from "./TournamentFactory.sol";
 import { GameTypes } from "./lib/GameTypes.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { Semver } from "../universal/Semver.sol";
-
+import { ISemver } from "interfaces/universal/ISemver.sol";
 /**
  * @title DisputeGameFactoryExtension
  * @notice Factory contract for creating and managing dispute games with support for DAVE's tournament-based games
  * @dev This contract extends the OP Stack's dispute game factory pattern to support tournament-based dispute games
  */
-contract DisputeGameFactoryExtension is Ownable, Semver {
+contract DisputeGameFactoryExtension is Ownable, ISemver {
     /**
      * @notice Mapping of game type to implementation address
      * @dev Maps game type identifier to the address of the factory contract for that game type
