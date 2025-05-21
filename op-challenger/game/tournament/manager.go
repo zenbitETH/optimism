@@ -1,442 +1,521 @@
-// Package tournament provides functionality for interacting with tournament-based dispute games.
 package tournament
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/ethereum-optimism/optimism/op-challenger/game/types"
-	"github.com/ethereum-optimism/optimism/op-service/clock"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
 )
 
-// TournamentFactoryContract defines the interface for interacting with the tournament factory contract
-type TournamentFactoryContract interface {
-	// GetActiveTournaments returns the addresses of all active tournaments
-	GetActiveTournaments(ctx context.Context) ([]common.Address, error)
+// TournamentManager manages tournament state and interactions
+type TournamentManager struct {
+	logger        log.Logger
+	loader        TournamentContract
+	traceProvider TraceProvider
+	matchMonitor  *MatchMonitor
+	txSender      TxSender
 
-	// GetTournamentCount returns the total number of tournaments created
-	GetTournamentCount(ctx context.Context) (uint64, error)
+	// Tournament state
+	gameAddress common.Address
+	rootClaim   common.Hash
+	l1Head      common.Hash
+	status      uint8
 
-	// GetTournamentAt returns the address of the tournament at the specified index
-	GetTournamentAt(ctx context.Context, index uint64) (common.Address, error)
+	// Caching
+	nodeCache     map[uint64]Node
+	matchCache    map[uint64]Match
+	cacheMutex    sync.RWMutex
+	lastRefresh   time.Time
+	refreshPeriod time.Duration
+
+	// Metrics
+	metrics *TournamentMetrics
 }
 
-// TournamentCreator creates new TournamentPlayer instances
-type TournamentCreator interface {
-	// CreateTournamentPlayer creates a new TournamentPlayer for the specified tournament address
-	CreateTournamentPlayer(ctx context.Context, addr common.Address) (*TournamentPlayer, error)
-}
-
-// TournamentState represents the state of a tournament
-type TournamentState struct {
-	Address      common.Address
-	Status       types.GameStatus
-	Participants uint64
-	CurrentRound uint64
-	MatchCount   uint64
-	RootClaim    common.Hash
-	L1Head       common.Hash
-	UpdatedAt    time.Time
-}
-
-// Manager is responsible for managing tournament state and interactions
-type Manager struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	logger           log.Logger
-	clock            clock.Clock
-	factory          TournamentFactoryContract
-	creator          TournamentCreator
-	players          map[common.Address]*TournamentPlayer
-	tournamentStates sync.Map // map[common.Address]TournamentState
-	pollInterval     time.Duration
-	wg               sync.WaitGroup
-}
-
-// NewManager creates a new tournament manager
-func NewManager(
-	ctx context.Context,
+// NewTournamentManager creates a new tournament manager
+func NewTournamentManager(
 	logger log.Logger,
-	clock clock.Clock,
-	factory TournamentFactoryContract,
-	creator TournamentCreator,
-	pollInterval time.Duration,
-) *Manager {
-	ctx, cancel := context.WithCancel(ctx)
-	return &Manager{
-		ctx:          ctx,
-		cancel:       cancel,
-		logger:       logger.New("component", "TournamentManager"),
-		clock:        clock,
-		factory:      factory,
-		creator:      creator,
-		players:      make(map[common.Address]*TournamentPlayer),
-		pollInterval: pollInterval,
+	loader TournamentContract,
+	traceProvider TraceProvider,
+	matchMonitor *MatchMonitor,
+	txSender TxSender,
+	gameAddress common.Address,
+) *TournamentManager {
+	return &TournamentManager{
+		logger:        logger.New("component", "TournamentManager", "game", gameAddress),
+		loader:        loader,
+		traceProvider: traceProvider,
+		matchMonitor:  matchMonitor,
+		txSender:      txSender,
+		gameAddress:   gameAddress,
+		nodeCache:     make(map[uint64]Node),
+		matchCache:    make(map[uint64]Match),
+		refreshPeriod: 2 * time.Minute,
+		metrics:       &TournamentMetrics{},
 	}
 }
 
-// Start starts the tournament manager
-func (m *Manager) Start() error {
-	m.logger.Info("Starting tournament manager")
+// Initialize initializes the tournament manager
+func (t *TournamentManager) Initialize(ctx context.Context) error {
+	t.logger.Info("Initializing tournament manager")
 
-	// Start the tournament monitoring loop
-	m.wg.Add(1)
-	go m.monitorTournaments()
+	// Get the root claim
+	rootClaim, err := t.loader.GetRootClaim(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get root claim: %w", err)
+	}
+	t.rootClaim = rootClaim
+
+	// Get the L1 head
+	l1Head, err := t.loader.GetL1Head(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get L1 head: %w", err)
+	}
+	t.l1Head = l1Head
+
+	// Get the status
+	status, err := t.loader.GetStatus(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get status: %w", err)
+	}
+	t.status = uint8(status)
+
+	// Refresh the state
+	if err := t.RefreshState(ctx); err != nil {
+		t.logger.Warn("Failed to refresh state during initialization", "err", err)
+	}
+
+	t.logger.Info("Tournament manager initialized",
+		"rootClaim", rootClaim.Hex(),
+		"l1Head", l1Head.Hex(),
+		"status", status)
 
 	return nil
 }
 
-// Stop stops the tournament manager
-func (m *Manager) Stop() {
-	m.logger.Info("Stopping tournament manager")
-	m.cancel()
-	m.wg.Wait()
-}
+// RefreshState refreshes the tournament state
+func (t *TournamentManager) RefreshState(ctx context.Context) error {
+	// Check if we need to refresh
+	t.cacheMutex.RLock()
+	needsRefresh := time.Since(t.lastRefresh) > t.refreshPeriod
+	t.cacheMutex.RUnlock()
 
-// GetTournamentState returns the state of a tournament
-func (m *Manager) GetTournamentState(ctx context.Context, addr common.Address) (TournamentState, error) {
-	// Check if we have the state cached
-	if state, ok := m.tournamentStates.Load(addr); ok {
-		return state.(TournamentState), nil
+	if !needsRefresh {
+		return nil
 	}
 
-	// If not cached, fetch the state from the blockchain
-	state, err := m.fetchTournamentState(ctx, addr)
+	t.logger.Debug("Refreshing tournament state")
+
+	// Get the status
+	status, err := t.loader.GetStatus(ctx)
 	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to fetch tournament state: %w", err)
+		return fmt.Errorf("failed to get status: %w", err)
 	}
+	t.status = uint8(status)
 
-	// Cache the state
-	m.tournamentStates.Store(addr, state)
-
-	return state, nil
-}
-
-// GetActiveTournaments returns the addresses of all active tournaments
-func (m *Manager) GetActiveTournaments(ctx context.Context) ([]common.Address, error) {
-	return m.factory.GetActiveTournaments(ctx)
-}
-
-// GetAllTournaments returns the addresses of all tournaments
-func (m *Manager) GetAllTournaments(ctx context.Context) ([]common.Address, error) {
-	count, err := m.factory.GetTournamentCount(ctx)
+	// Get the total participants
+	participants, err := t.loader.GetTotalParticipants(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tournament count: %w", err)
-	}
-
-	tournaments := make([]common.Address, 0, count)
-	for i := uint64(0); i < count; i++ {
-		addr, err := m.factory.GetTournamentAt(ctx, i)
-		if err != nil {
-			m.logger.Error("Failed to get tournament at index", "index", i, "err", err)
-			continue
-		}
-		tournaments = append(tournaments, addr)
-	}
-
-	return tournaments, nil
-}
-
-// GetTournamentPlayer returns the TournamentPlayer for the specified tournament address
-func (m *Manager) GetTournamentPlayer(ctx context.Context, addr common.Address) (*TournamentPlayer, error) {
-	// Check if we already have a player for this tournament
-	if player, ok := m.players[addr]; ok {
-		return player, nil
-	}
-
-	// Create a new player
-	player, err := m.creator.CreateTournamentPlayer(ctx, addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tournament player: %w", err)
-	}
-
-	// Store the player
-	m.players[addr] = player
-
-	return player, nil
-}
-
-// ProgressTournament progresses the specified tournament
-func (m *Manager) ProgressTournament(ctx context.Context, addr common.Address) (types.GameStatus, error) {
-	player, err := m.GetTournamentPlayer(ctx, addr)
-	if err != nil {
-		return types.GameStatusInProgress, fmt.Errorf("failed to get tournament player: %w", err)
-	}
-
-	status := player.ProgressGame(ctx)
-
-	// Update the cached state
-	m.updateTournamentState(ctx, addr)
-
-	return status, nil
-}
-
-// ValidateTournamentPrestate validates the prestate of the specified tournament
-func (m *Manager) ValidateTournamentPrestate(ctx context.Context, addr common.Address) error {
-	player, err := m.GetTournamentPlayer(ctx, addr)
-	if err != nil {
-		return fmt.Errorf("failed to get tournament player: %w", err)
-	}
-
-	return player.ValidatePrestate(ctx)
-}
-
-// monitorTournaments monitors active tournaments
-func (m *Manager) monitorTournaments() {
-	defer m.wg.Done()
-
-	ticker := m.clock.NewTicker(m.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-ticker.Ch():
-			if err := m.checkActiveTournaments(); err != nil {
-				m.logger.Error("Failed to check active tournaments", "err", err)
-			}
-		}
-	}
-}
-
-// checkActiveTournaments checks all active tournaments
-func (m *Manager) checkActiveTournaments() error {
-	ctx, cancel := context.WithTimeout(m.ctx, m.pollInterval/2)
-	defer cancel()
-
-	// Get all active tournaments
-	activeTournaments, err := m.factory.GetActiveTournaments(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get active tournaments: %w", err)
-	}
-
-	m.logger.Debug("Checking active tournaments", "count", len(activeTournaments))
-
-	// Process each active tournament
-	for _, addr := range activeTournaments {
-		if err := m.processTournament(ctx, addr); err != nil {
-			m.logger.Error("Failed to process tournament", "addr", addr, "err", err)
-		}
-	}
-
-	return nil
-}
-
-// processTournament processes a single tournament
-func (m *Manager) processTournament(ctx context.Context, addr common.Address) error {
-	// Update the tournament state
-	if err := m.updateTournamentState(ctx, addr); err != nil {
-		return fmt.Errorf("failed to update tournament state: %w", err)
-	}
-
-	// Progress the tournament
-	if _, err := m.ProgressTournament(ctx, addr); err != nil {
-		return fmt.Errorf("failed to progress tournament: %w", err)
-	}
-
-	return nil
-}
-
-// fetchTournamentState fetches the state of a tournament from the blockchain
-func (m *Manager) fetchTournamentState(ctx context.Context, addr common.Address) (TournamentState, error) {
-	// Get the tournament contract
-	player, err := m.GetTournamentPlayer(ctx, addr)
-	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get tournament player: %w", err)
-	}
-
-	// Get the tournament info
-	loader, ok := player.loader.(TournamentContract)
-	if !ok {
-		return TournamentState{}, errors.New("tournament player loader is not a TournamentContract")
-	}
-
-	// Get the tournament status
-	status, err := loader.GetStatus(ctx)
-	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get tournament status: %w", err)
-	}
-
-	// Get the tournament participants
-	participants, err := loader.GetTotalParticipants(ctx)
-	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get tournament participants: %w", err)
+		return fmt.Errorf("failed to get total participants: %w", err)
 	}
 
 	// Get the current round
-	currentRound, err := loader.GetCurrentRound(ctx)
+	round, err := t.loader.GetCurrentRound(ctx)
 	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get current round: %w", err)
+		return fmt.Errorf("failed to get current round: %w", err)
 	}
 
 	// Get the match count
-	matchCount, err := loader.GetMatchCount(ctx)
+	matchCount, err := t.loader.GetMatchCount(ctx)
 	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get match count: %w", err)
+		return fmt.Errorf("failed to get match count: %w", err)
 	}
 
-	// Get the root claim
-	rootClaim, err := loader.GetRootClaim(ctx)
-	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get root claim: %w", err)
+	// Count resolved matches
+	resolvedMatches := uint64(0)
+	activeMatches := uint64(0)
+
+	// Clear the caches
+	t.cacheMutex.Lock()
+	t.nodeCache = make(map[uint64]Node)
+	t.matchCache = make(map[uint64]Match)
+
+	// Refresh match cache
+	for i := uint64(0); i < matchCount; i++ {
+		match, err := t.loader.GetMatch(ctx, i)
+		if err != nil {
+			t.logger.Error("Failed to get match", "index", i, "err", err)
+			continue
+		}
+
+		t.matchCache[i] = match
+
+		if match.Resolved {
+			resolvedMatches++
+		} else {
+			activeMatches++
+		}
+
+		// Cache the nodes for this match
+		if _, exists := t.nodeCache[match.NodeA]; !exists {
+			nodeA, err := t.loader.GetNode(ctx, match.NodeA)
+			if err != nil {
+				t.logger.Error("Failed to get node", "index", match.NodeA, "err", err)
+			} else {
+				t.nodeCache[match.NodeA] = nodeA
+			}
+		}
+
+		if _, exists := t.nodeCache[match.NodeB]; !exists {
+			nodeB, err := t.loader.GetNode(ctx, match.NodeB)
+			if err != nil {
+				t.logger.Error("Failed to get node", "index", match.NodeB, "err", err)
+			} else {
+				t.nodeCache[match.NodeB] = nodeB
+			}
+		}
 	}
 
-	// Get the L1 head
-	l1Head, err := loader.GetL1Head(ctx)
-	if err != nil {
-		return TournamentState{}, fmt.Errorf("failed to get L1 head: %w", err)
-	}
+	// Update metrics
+	t.metrics.TotalMatches = matchCount
+	t.metrics.ResolvedMatches = resolvedMatches
+	t.metrics.ActiveMatches = activeMatches
+	t.metrics.TotalParticipants = participants
+	t.metrics.CurrentRound = round
+	t.metrics.LastUpdateTime = time.Now()
 
-	return TournamentState{
-		Address:      addr,
-		Status:       status,
-		Participants: participants,
-		CurrentRound: currentRound,
-		MatchCount:   matchCount,
-		RootClaim:    rootClaim,
-		L1Head:       l1Head,
-		UpdatedAt:    m.clock.Now(),
-	}, nil
-}
+	t.lastRefresh = time.Now()
+	t.cacheMutex.Unlock()
 
-// updateTournamentState updates the cached state of a tournament
-func (m *Manager) updateTournamentState(ctx context.Context, addr common.Address) error {
-	state, err := m.fetchTournamentState(ctx, addr)
-	if err != nil {
-		return fmt.Errorf("failed to fetch tournament state: %w", err)
-	}
-
-	m.tournamentStates.Store(addr, state)
+	t.logger.Info("Tournament state refreshed",
+		"status", status,
+		"participants", participants,
+		"round", round,
+		"matches", matchCount,
+		"resolved", resolvedMatches,
+		"active", activeMatches)
 
 	return nil
 }
 
-// GetTournamentMatches returns the matches for a tournament
-func (m *Manager) GetTournamentMatches(ctx context.Context, addr common.Address) ([]Match, error) {
-	// Get the tournament contract
-	player, err := m.GetTournamentPlayer(ctx, addr)
+// GetStatus returns the current status of the tournament
+func (t *TournamentManager) GetStatus(ctx context.Context) (uint8, error) {
+	if err := t.RefreshState(ctx); err != nil {
+		return t.status, err
+	}
+	return t.status, nil
+}
+
+// IsComplete checks if the tournament is complete
+func (t *TournamentManager) IsComplete(ctx context.Context) (bool, error) {
+	status, err := t.GetStatus(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tournament player: %w", err)
+		return false, err
+	}
+	return status != 0, nil // 0 = IN_PROGRESS
+}
+
+// GetNode returns information about a node in the tournament tree
+func (t *TournamentManager) GetNode(ctx context.Context, nodeIndex uint64) (Node, error) {
+	// Check the cache first
+	t.cacheMutex.RLock()
+	node, exists := t.nodeCache[nodeIndex]
+	t.cacheMutex.RUnlock()
+
+	if exists {
+		return node, nil
 	}
 
-	// Get the tournament info
-	loader, ok := player.loader.(TournamentContract)
-	if !ok {
-		return nil, errors.New("tournament player loader is not a TournamentContract")
-	}
-
-	// Get the match count
-	matchCount, err := loader.GetMatchCount(ctx)
+	// Get from the contract
+	node, err := t.loader.GetNode(ctx, nodeIndex)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get match count: %w", err)
+		return Node{}, err
 	}
 
-	// Get all matches
-	matches := make([]Match, 0, matchCount)
-	for i := uint64(0); i < matchCount; i++ {
-		match, err := loader.GetMatch(ctx, i)
+	// Update the cache
+	t.cacheMutex.Lock()
+	t.nodeCache[nodeIndex] = node
+	t.cacheMutex.Unlock()
+
+	return node, nil
+}
+
+// GetMatch returns information about a match in the tournament
+func (t *TournamentManager) GetMatch(ctx context.Context, matchIndex uint64) (Match, error) {
+	// Check the cache first
+	t.cacheMutex.RLock()
+	match, exists := t.matchCache[matchIndex]
+	t.cacheMutex.RUnlock()
+
+	if exists {
+		return match, nil
+	}
+
+	// Get from the contract
+	match, err := t.loader.GetMatch(ctx, matchIndex)
+	if err != nil {
+		return Match{}, err
+	}
+
+	// Update the cache
+	t.cacheMutex.Lock()
+	t.matchCache[matchIndex] = match
+	t.cacheMutex.Unlock()
+
+	return match, nil
+}
+
+// GetActiveMatches returns the list of active matches
+func (t *TournamentManager) GetActiveMatches(ctx context.Context) ([]uint64, error) {
+	if err := t.RefreshState(ctx); err != nil {
+		return nil, err
+	}
+
+	t.cacheMutex.RLock()
+	defer t.cacheMutex.RUnlock()
+
+	activeMatches := make([]uint64, 0, t.metrics.ActiveMatches)
+	for idx, match := range t.matchCache {
+		if !match.Resolved {
+			activeMatches = append(activeMatches, idx)
+		}
+	}
+
+	return activeMatches, nil
+}
+
+// GetPrioritizedMatches returns the list of active matches in priority order
+func (t *TournamentManager) GetPrioritizedMatches(ctx context.Context) ([]uint64, error) {
+	return t.matchMonitor.GetPrioritizedMatches(ctx)
+}
+
+// JoinTournament joins the tournament with a counter-claim
+func (t *TournamentManager) JoinTournament(ctx context.Context, claim common.Hash) error {
+	t.logger.Info("Joining tournament", "claim", claim.Hex())
+
+	// Check if we've already participated
+	hasParticipated, err := t.loader.HasParticipated(ctx, t.txSender.From())
+	if err != nil {
+		return fmt.Errorf("failed to check if we've participated: %w", err)
+	}
+
+	if hasParticipated {
+		t.logger.Info("Already participated in tournament")
+		return nil
+	}
+
+	// Join the tournament
+	if err := t.loader.JoinTournament(ctx, claim); err != nil {
+		return fmt.Errorf("failed to join tournament: %w", err)
+	}
+
+	// Refresh the state
+	t.cacheMutex.Lock()
+	t.lastRefresh = time.Time{} // Force refresh
+	t.cacheMutex.Unlock()
+
+	if err := t.RefreshState(ctx); err != nil {
+		t.logger.Warn("Failed to refresh state after joining tournament", "err", err)
+	}
+
+	t.logger.Info("Successfully joined tournament")
+	return nil
+}
+
+// ResolveMatch resolves a match in the tournament
+func (t *TournamentManager) ResolveMatch(ctx context.Context, matchIndex uint64, winnerIndex uint64) error {
+	t.logger.Info("Resolving match", "matchIndex", matchIndex, "winnerIndex", winnerIndex)
+
+	// Get the match
+	match, err := t.GetMatch(ctx, matchIndex)
+	if err != nil {
+		return fmt.Errorf("failed to get match: %w", err)
+	}
+
+	// Check if the match is already resolved
+	if match.Resolved {
+		t.logger.Info("Match already resolved", "matchIndex", matchIndex)
+		return nil
+	}
+
+	// Check if we're a participant in this match
+	nodeA, err := t.GetNode(ctx, match.NodeA)
+	if err != nil {
+		return fmt.Errorf("failed to get node A: %w", err)
+	}
+
+	nodeB, err := t.GetNode(ctx, match.NodeB)
+	if err != nil {
+		return fmt.Errorf("failed to get node B: %w", err)
+	}
+
+	if nodeA.Participant != t.txSender.From() && nodeB.Participant != t.txSender.From() {
+		return fmt.Errorf("not a participant in this match")
+	}
+
+	// Check if the match deadline has passed
+	deadline, err := t.matchMonitor.GetMatchDeadline(ctx, matchIndex)
+	if err != nil {
+		return fmt.Errorf("failed to get match deadline: %w", err)
+	}
+
+	if time.Now().Before(deadline) {
+		// Check if we're considering effort
+		effortDeadline, err := t.matchMonitor.GetMatchEffortDeadline(ctx, matchIndex)
 		if err != nil {
-			m.logger.Error("Failed to get match", "index", i, "err", err)
-			continue
+			return fmt.Errorf("failed to get match effort deadline: %w", err)
 		}
-		matches = append(matches, match)
+
+		if time.Now().Before(effortDeadline) {
+			return fmt.Errorf("match deadline has not passed yet (with effort): %v", effortDeadline)
+		}
 	}
 
-	return matches, nil
+	// Resolve the match
+	if err := t.loader.ResolveMatch(ctx, matchIndex, winnerIndex); err != nil {
+		return fmt.Errorf("failed to resolve match: %w", err)
+	}
+
+	// Refresh the state
+	t.cacheMutex.Lock()
+	t.lastRefresh = time.Time{} // Force refresh
+	t.cacheMutex.Unlock()
+
+	if err := t.RefreshState(ctx); err != nil {
+		t.logger.Warn("Failed to refresh state after resolving match", "err", err)
+	}
+
+	t.logger.Info("Successfully resolved match", "matchIndex", matchIndex, "winnerIndex", winnerIndex)
+	return nil
 }
 
-// GetTournamentNodes returns the nodes for a tournament
-func (m *Manager) GetTournamentNodes(ctx context.Context, addr common.Address) ([]Node, error) {
-	// Get the tournament contract
-	player, err := m.GetTournamentPlayer(ctx, addr)
+// ClaimBond claims the bond as the tournament winner
+func (t *TournamentManager) ClaimBond(ctx context.Context) error {
+	t.logger.Info("Claiming bond")
+
+	// Check if the tournament is complete
+	isComplete, err := t.IsComplete(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tournament player: %w", err)
+		return fmt.Errorf("failed to check if tournament is complete: %w", err)
 	}
 
-	// Get the tournament info
-	loader, ok := player.loader.(TournamentContract)
-	if !ok {
-		return nil, errors.New("tournament player loader is not a TournamentContract")
+	if !isComplete {
+		return fmt.Errorf("tournament is not complete")
 	}
 
-	// Get the participant count
-	participantCount, err := loader.GetTotalParticipants(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get participant count: %w", err)
+	// Claim the bond
+	if err := t.loader.ClaimBond(ctx); err != nil {
+		return fmt.Errorf("failed to claim bond: %w", err)
 	}
 
-	// Get all nodes
-	nodes := make([]Node, 0, participantCount)
-	for i := uint64(0); i < participantCount; i++ {
-		node, err := loader.GetNode(ctx, i)
-		if err != nil {
-			m.logger.Error("Failed to get node", "index", i, "err", err)
-			continue
-		}
-		nodes = append(nodes, node)
-	}
-
-	return nodes, nil
+	t.logger.Info("Successfully claimed bond")
+	return nil
 }
 
-// GetTournamentStats returns statistics for a tournament
-func (m *Manager) GetTournamentStats(ctx context.Context, addr common.Address) (map[string]interface{}, error) {
-	state, err := m.GetTournamentState(ctx, addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tournament state: %w", err)
+// GetMetrics returns the current tournament metrics
+func (t *TournamentManager) GetMetrics() *TournamentMetrics {
+	t.cacheMutex.RLock()
+	defer t.cacheMutex.RUnlock()
+
+	// Create a copy of the metrics
+	metrics := &TournamentMetrics{
+		TotalMatches:      t.metrics.TotalMatches,
+		ResolvedMatches:   t.metrics.ResolvedMatches,
+		ActiveMatches:     t.metrics.ActiveMatches,
+		TotalParticipants: t.metrics.TotalParticipants,
+		CurrentRound:      t.metrics.CurrentRound,
+		LastUpdateTime:    t.metrics.LastUpdateTime,
 	}
 
-	matches, err := m.GetTournamentMatches(ctx, addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tournament matches: %w", err)
-	}
-
-	nodes, err := m.GetTournamentNodes(ctx, addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tournament nodes: %w", err)
-	}
-
-	// Calculate statistics
-	resolvedMatches := 0
-	for _, match := range matches {
-		if match.Resolved {
-			resolvedMatches++
-		}
-	}
-
-	joinedNodes := 0
-	for _, node := range nodes {
-		if node.HasJoined {
-			joinedNodes++
-		}
-	}
-
-	return map[string]interface{}{
-		"address":          state.Address,
-		"status":           state.Status,
-		"participants":     state.Participants,
-		"currentRound":     state.CurrentRound,
-		"matchCount":       state.MatchCount,
-		"resolvedMatches":  resolvedMatches,
-		"joinedNodes":      joinedNodes,
-		"rootClaim":        state.RootClaim,
-		"l1Head":           state.L1Head,
-		"updatedAt":        state.UpdatedAt,
-		"completionRatio":  float64(resolvedMatches) / float64(state.MatchCount),
-		"participantRatio": float64(joinedNodes) / float64(state.Participants),
-	}, nil
+	return metrics
 }
 
-// TournamentCreatorFunc is a function that creates a TournamentPlayer
-type TournamentCreatorFunc func(ctx context.Context, addr common.Address) (*TournamentPlayer, error)
+// DetermineWinner determines the winner of a match based on trace evidence
+func (t *TournamentManager) DetermineWinner(ctx context.Context, matchIndex uint64) (uint64, error) {
+	t.logger.Debug("Determining winner for match", "matchIndex", matchIndex)
 
-// CreateTournamentPlayer implements the TournamentCreator interface
-func (f TournamentCreatorFunc) CreateTournamentPlayer(ctx context.Context, addr common.Address) (*TournamentPlayer, error) {
-	return f(ctx, addr)
+	// Get the match
+	match, err := t.GetMatch(ctx, matchIndex)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get match: %w", err)
+	}
+
+	// Get the nodes
+	nodeA, err := t.GetNode(ctx, match.NodeA)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get node A: %w", err)
+	}
+
+	nodeB, err := t.GetNode(ctx, match.NodeB)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get node B: %w", err)
+	}
+
+	// Generate proofs for both claims
+	proofA, err := t.traceProvider.GenerateProof(ctx, match.NodeA)
+	if err != nil {
+		t.logger.Error("Failed to generate proof for node A", "err", err)
+		return match.NodeB, nil // Default to node B if we can't generate proof for node A
+	}
+
+	proofB, err := t.traceProvider.GenerateProof(ctx, match.NodeB)
+	if err != nil {
+		t.logger.Error("Failed to generate proof for node B", "err", err)
+		return match.NodeA, nil // Default to node A if we can't generate proof for node B
+	}
+
+	// Verify the proofs
+	validA, err := t.traceProvider.VerifyProof(ctx, nodeA.Claim, proofA)
+	if err != nil {
+		t.logger.Error("Failed to verify proof for node A", "err", err)
+		validA = false
+	}
+
+	validB, err := t.traceProvider.VerifyProof(ctx, nodeB.Claim, proofB)
+	if err != nil {
+		t.logger.Error("Failed to verify proof for node B", "err", err)
+		validB = false
+	}
+
+	// Determine the winner based on proof validity
+	if validA && !validB {
+		return match.NodeA, nil
+	} else if !validA && validB {
+		return match.NodeB, nil
+	} else if !validA && !validB {
+		// If neither proof is valid, default to the defender (node A)
+		return match.NodeA, nil
+	}
+
+	// If both proofs are valid, we need to determine the winner based on the actual execution
+	// This would involve comparing the execution traces and determining which one is correct
+	// For now, we'll use a simplified approach based on the architecture
+	arch := t.traceProvider.GetArchitecture()
+
+	if arch == "riscv" {
+		// For RISC-V, we'll use a more sophisticated approach
+		// In a real implementation, this would involve running the execution in the Cartesi Machine
+		// and comparing the results
+
+		// For now, we'll use a simplified approach based on the claim values
+		if nodeA.Claim[0] < nodeB.Claim[0] {
+			return match.NodeA, nil
+		} else {
+			return match.NodeB, nil
+		}
+	} else {
+		// For MIPS64, we'll use a simpler approach
+		// In a real implementation, this would involve running the execution in Cannon
+		// and comparing the results
+
+		// For now, we'll use a simplified approach based on the claim values
+		if nodeA.Claim[0] > nodeB.Claim[0] {
+			return match.NodeA, nil
+		} else {
+			return match.NodeB, nil
+		}
+	}
 }

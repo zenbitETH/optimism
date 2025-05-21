@@ -120,12 +120,16 @@ type TournamentMetrics struct {
 type RISCVMachineConfig struct {
 	// RomFilePath is the path to the ROM file for the RISC-V machine
 	RomFilePath string
+
 	// RamSize is the size of RAM in bytes for the RISC-V machine
 	RamSize uint64
+
 	// KernelFilePath is the path to the Linux kernel image for the RISC-V machine
 	KernelFilePath string
+
 	// RootFSPath is the path to the root filesystem for the RISC-V machine
 	RootFSPath string
+
 	// MaxCycles is the maximum number of cycles to execute
 	MaxCycles uint64
 }
