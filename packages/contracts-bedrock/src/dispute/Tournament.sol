@@ -1,356 +1,417 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.15;
 
-import { ITournament } from "interfaces/dispute/ITournament.sol";
-import { IDisputeGame } from "interfaces/dispute/IDisputeGame.sol";
+import { ITournamentGame } from "interfaces/dispute/ITournamentGame.sol";
+import { IDisputeGameDAVE } from "interfaces/dispute/IDisputeGameDAVE.sol";
+import { GameStatus } from "src/dispute/lib/GameTypes.sol";
 
 /**
- * @title Tournament
- * @notice Implements a tournament-based dispute resolution mechanism
- * @dev Implements both ITournament and IDisputeGame interfaces
+ * @title Tournament Contract for Cartesi DAVE Fraud Proofs
+ * @notice This contract implements a tournament tree structure for dispute resolution
+ * @dev Implements the IDisputeGameDAVE interface for compatibility with OP Stack
  */
-contract Tournament is ITournament, IDisputeGame {
-    /// @notice The root claim being disputed
-    bytes32 public rootClaim;
+contract Tournament is IDisputeGameDAVE {
+    // Constants
+    uint8 private constant GAME_TYPE = 3; // DAVE Tournament type
+    uint256 private constant MATCH_DURATION = 1 days; // Duration for each match
+    uint256 private constant BOND_AMOUNT = 0.1 ether; // Bond amount required to join
 
-    /// @notice The challenge period duration in seconds
-    uint256 public challengePeriod;
+    // Tournament tree structure
+    struct Node {
+        address participant;
+        bytes32 claim;
+        bool hasJoined;
+        uint256 bondAmount;
+    }
 
-    /// @notice The bond required to participate in the tournament
-    uint256 public bondSize;
+    struct Match {
+        uint256 nodeA;
+        uint256 nodeB;
+        uint256 winner;
+        uint256 startTime;
+        bool resolved;
+    }
 
-    /// @notice The creator of the tournament
-    address public creator;
-
-    /// @notice The timestamp when the tournament was created
-    uint64 public override createdAt;
-
-    /// @notice The current status of the tournament
+    // Tournament state variables
+    bytes32 private immutable _rootClaim;
+    bytes32 private immutable _l1Head;
+    address private immutable _gameCreator;
+    bytes private _extraData;
+    uint256 private immutable _createdAt;
+    uint256 private _resolvedAt;
     GameStatus private _status;
 
-    /// @notice The L2 block number associated with this dispute
-    uint256 private _l2BlockNumber;
+    // Tournament specific variables
+    Node[] public nodes;
+    Match[] public matches;
+    uint256 public currentRound;
+    uint256 public totalParticipants;
+    mapping(address => bool) public hasParticipated;
+    mapping(uint256 => uint256) public roundStartTime;
 
-    /// @notice Array of all nodes in the tournament
-    Node[] private _nodes;
+    // Events
+    event TournamentStarted(bytes32 rootClaim, address gameCreator);
+    event ParticipantJoined(address participant, uint256 nodeIndex, bytes32 claim);
+    event MatchCreated(uint256 matchIndex, uint256 nodeA, uint256 nodeB);
+    event MatchResolved(uint256 matchIndex, uint256 winner);
+    event BondClaimed(address winner, uint256 amount);
+    event RoundAdvanced(uint256 newRound);
 
-    /// @notice Array of all matches in the tournament
-    Match[] private _matches;
-
-    /// @notice Mapping of claim hashes to their node indices
-    mapping(bytes32 => uint256) public claimIndices;
-
-    /// @notice Mapping of addresses to their bond balances
-    mapping(address => uint256) public bonds;
+    // Errors
+    error TournamentAlreadyResolved();
+    error InvalidParticipant();
+    error InsufficientBond();
+    error AlreadyParticipated();
+    error MatchNotStarted();
+    error MatchAlreadyResolved();
+    error MatchInProgress();
+    error NotMatchParticipant();
+    error TournamentNotResolved();
+    error NotTournamentWinner();
 
     /**
      * @notice Constructor for the Tournament contract
-     * @param _rootClaim The root claim being disputed
-     * @param _challengePeriod The challenge period duration in seconds
-     * @param _bondSize The bond required to participate in the tournament
-     * @param _creator The creator of the tournament
-     * @param _inl2BlockNumber The L2 block number associated with this dispute
+     * @param initialRootClaim The root claim being disputed
+     * @param initialL1Head The L1 head hash at creation time
+     * @param initialExtraData Additional data for the tournament
      */
-    constructor(
-        bytes32 _rootClaim,
-        uint256 _challengePeriod,
-        uint256 _bondSize,
-        address _creator,
-        uint256 _inl2BlockNumber
-    ) {
-        rootClaim = _rootClaim;
-        challengePeriod = _challengePeriod;
-        bondSize = _bondSize;
-        creator = _creator;
-        createdAt = uint64(block.timestamp);
+    constructor(bytes32 initialRootClaim, bytes32 initialL1Head, bytes memory initialExtraData) {
+        _rootClaim = initialRootClaim;
+        _l1Head = initialL1Head;
+        _gameCreator = msg.sender;
+        _extraData = initialExtraData;
+        _createdAt = block.timestamp;
         _status = GameStatus.IN_PROGRESS;
-        _l2BlockNumber = _inl2BlockNumber;
 
-        // Initialize with root node
-        _nodes.push(Node({
-            claim: _rootClaim,
-            claimant: _creator,
-            timestamp: uint64(block.timestamp),
-            challenged: false
+        // Initialize the tournament with the root node (defender)
+        nodes.push(Node({
+            participant: msg.sender,
+            claim: initialRootClaim,
+            hasJoined: true,
+            bondAmount: 0 // Creator doesn't need to bond
         }));
+        totalParticipants = 1;
 
-        claimIndices[_rootClaim] = 0;
+        // Initialize the first round
+        roundStartTime[currentRound] = block.timestamp;
 
-        emit ClaimAdded(0, _rootClaim, _creator);
+        emit TournamentStarted(initialRootClaim, msg.sender);
     }
 
     /**
      * @notice Join the tournament with a counter-claim
-     * @param _claim The claim to submit
-     * @param _parentClaimIndex The index of the parent claim being challenged
-     * @return The index of the newly created node
+     * @param claim The counter-claim being made
      */
-    function joinTournament(
-        bytes32 _claim,
-        uint256 _parentClaimIndex
-    ) external payable override returns (uint256) {
-        require(_status == GameStatus.IN_PROGRESS, "Tournament not in progress");
-        require(_parentClaimIndex < _nodes.length, "Invalid parent claim index");
-        require(!_nodes[_parentClaimIndex].challenged, "Claim already challenged");
-        require(msg.value >= bondSize, "Insufficient bond");
+    function joinTournament(bytes32 claim) external payable {
+        if (_status != GameStatus.IN_PROGRESS) revert TournamentAlreadyResolved();
+        if (msg.sender == address(0)) revert InvalidParticipant();
+        if (msg.value < BOND_AMOUNT) revert InsufficientBond();
+        if (hasParticipated[msg.sender]) revert AlreadyParticipated();
 
-        // Store bond
-        bonds[msg.sender] += msg.value;
-
-        // Create new node
-        uint256 nodeIndex = _nodes.length;
-        _nodes.push(Node({
-            claim: _claim,
-            claimant: msg.sender,
-            timestamp: uint64(block.timestamp),
-            challenged: false
+        // Add the participant to the tournament
+        uint256 nodeIndex = nodes.length;
+        nodes.push(Node({
+            participant: msg.sender,
+            claim: claim,
+            hasJoined: true,
+            bondAmount: msg.value
         }));
+        hasParticipated[msg.sender] = true;
+        totalParticipants++;
 
-        claimIndices[_claim] = nodeIndex;
+        emit ParticipantJoined(msg.sender, nodeIndex, claim);
 
-        // Mark parent as challenged
-        _nodes[_parentClaimIndex].challenged = true;
-
-        // Create match
-        uint256 matchIndex = _matches.length;
-        _matches.push(Match({
-            nodeIndex1: _parentClaimIndex,
-            nodeIndex2: nodeIndex,
-            deadline: uint64(block.timestamp + challengePeriod),
-            winner: 0,
-            evidence: bytes32(0)
-        }));
-
-        emit ClaimAdded(nodeIndex, _claim, msg.sender);
-        emit MatchCreated(matchIndex, _parentClaimIndex, nodeIndex);
-
-        return nodeIndex;
-    }
-
-    /**
-     * @notice Submit evidence for a match
-     * @param _matchIndex The index of the match
-     * @param _evidence The evidence hash
-     */
-    function submitEvidence(uint256 _matchIndex, bytes32 _evidence) external override {
-        require(_status == GameStatus.IN_PROGRESS, "Tournament not in progress");
-        require(_matchIndex < _matches.length, "Invalid match index");
-
-        Match storage xMatch = _matches[_matchIndex];
-        require(xMatch.winner == 0, "Match already resolved");
-
-        // Verify sender is a participant in the match
-        Node storage node1 = _nodes[xMatch.nodeIndex1];
-        Node storage node2 = _nodes[xMatch.nodeIndex2];
-        require(
-            msg.sender == node1.claimant || msg.sender == node2.claimant,
-            "Not a participant in this match"
-        );
-
-        // Store evidence
-        xMatch.evidence = _evidence;
+        // If we have a power of 2 number of participants, create matches for the new round
+        if (isPowerOfTwo(totalParticipants)) {
+            createMatchesForNewRound();
+        }
     }
 
     /**
      * @notice Resolve a match in the tournament
-     * @param _matchIndex The index of the match to resolve
+     * @param matchIndex The index of the match to resolve
+     * @param winnerIndex The index of the winning node
      */
-    function resolveMatch(uint256 _matchIndex) external override {
-        require(_status == GameStatus.IN_PROGRESS, "Tournament not in progress");
-        require(_matchIndex < _matches.length, "Invalid match index");
+    function resolveMatch(uint256 matchIndex, uint256 winnerIndex) external {
+        if (_status != GameStatus.IN_PROGRESS) revert TournamentAlreadyResolved();
+        if (matchIndex >= matches.length) revert MatchNotStarted();
 
-        Match storage xMatch = _matches[_matchIndex];
-        require(xMatch.winner == 0, "Match already resolved");
+        Match storage currentMatch = matches[matchIndex];
+        if (currentMatch.resolved) revert MatchAlreadyResolved();
+        if (block.timestamp < currentMatch.startTime + MATCH_DURATION) revert MatchInProgress();
 
-        // Check if deadline has passed
-        if (block.timestamp > xMatch.deadline) {
-            // Default winner is the first node (defender)
-            xMatch.winner = xMatch.nodeIndex1;
-        } else {
-            // In a real implementation, this would involve verification of evidence
-            // For now, this is a placeholder that defaults to the defender
-            xMatch.winner = xMatch.nodeIndex1;
+        // Verify the caller is a participant in the match
+        if (msg.sender != nodes[currentMatch.nodeA].participant &&
+            msg.sender != nodes[currentMatch.nodeB].participant) {
+            revert NotMatchParticipant();
         }
 
-        emit MatchResolved(_matchIndex, xMatch.winner);
+        // Verify the winner is part of the match
+        if (winnerIndex != currentMatch.nodeA && winnerIndex != currentMatch.nodeB) {
+            revert NotMatchParticipant();
+        }
 
-        // Check if tournament is complete
-        checkTournamentCompletion();
-    }
+        // Resolve the match
+        currentMatch.winner = winnerIndex;
+        currentMatch.resolved = true;
 
-    /**
-     * @notice Check if the tournament is complete
-     */
-    function checkTournamentCompletion() internal {
+        emit MatchResolved(matchIndex, winnerIndex);
+
+        // Check if all matches in the current round are resolved
         bool allMatchesResolved = true;
-
-        for (uint256 i = 0; i < _matches.length; i++) {
-            if (_matches[i].winner == 0) {
+        for (uint256 i = 0; i < matches.length; i++) {
+            if (!matches[i].resolved) {
                 allMatchesResolved = false;
                 break;
             }
         }
 
-        if (allMatchesResolved && _matches.length > 0) {
-            // Find the ultimate winner
-            uint256 winnerIndex = 0;
-            for (uint256 i = 0; i < _matches.length; i++) {
-                if (_matches[i].nodeIndex1 == winnerIndex || _matches[i].nodeIndex2 == winnerIndex) {
-                    winnerIndex = _matches[i].winner;
-                }
-            }
-
-            // Determine game status based on winner
-            if (winnerIndex == 0) {
-                // Root claim wins (defender)
-                _status = GameStatus.DEFENDER_WINS;
+        // If all matches are resolved, advance to the next round or resolve the tournament
+        if (allMatchesResolved) {
+            if (matches.length == 1) {
+                // Final match resolved, tournament is over
+                _resolvedAt = block.timestamp;
+                _status = determineWinner();
+                emit Resolved(_status);
             } else {
-                // Challenger wins
-                _status = GameStatus.CHALLENGER_WINS;
+                // Create matches for the next round
+                currentRound++;
+                roundStartTime[currentRound] = block.timestamp;
+                createMatchesForNextRound();
+                emit RoundAdvanced(currentRound);
             }
-
-            // Emit tournament resolved event
-            emit TournamentResolved(_status, _nodes[winnerIndex].claim);
-
-            // Distribute bonds
-            distributeBonds();
         }
     }
 
     /**
-     * @notice Distribute bonds to winners
+     * @notice Claim the bond as the tournament winner
      */
-    function distributeBonds() internal {
-        // In a real implementation, this would distribute bonds based on the tournament outcome
-        // For now, this is a placeholder
+    function claimBond() external {
+        if (_status == GameStatus.IN_PROGRESS) revert TournamentNotResolved();
 
-        // Return bond to the winner
-        address winner = _nodes[0].claimant; // Default to defender
-        if (_status == GameStatus.CHALLENGER_WINS) {
-            // Find the ultimate winner
-            uint256 winnerIndex = 0;
-            for (uint256 i = 0; i < _matches.length; i++) {
-                if (_matches[i].nodeIndex1 == winnerIndex || _matches[i].nodeIndex2 == winnerIndex) {
-                    winnerIndex = _matches[i].winner;
-                }
-            }
-            winner = _nodes[winnerIndex].claimant;
+        // Determine the winner address based on the final status
+        address winner;
+        if (_status == GameStatus.DEFENDER_WINS) {
+            winner = nodes[0].participant; // Root claim defender
+        } else {
+            // Find the challenger who won
+            winner = findWinningChallenger();
         }
 
-        uint256 winnerBond = bonds[winner];
-        if (winnerBond > 0) {
-            bonds[winner] = 0;
-            payable(winner).transfer(winnerBond);
+        if (msg.sender != winner) revert NotTournamentWinner();
+
+        // Calculate total bond amount
+        uint256 totalBond = 0;
+        for (uint256 i = 1; i < nodes.length; i++) { // Skip the defender (index 0)
+            totalBond += nodes[i].bondAmount;
         }
+
+        // Transfer the bond to the winner
+        payable(winner).transfer(totalBond);
+
+        emit BondClaimed(winner, totalBond);
     }
 
     /**
-     * @notice Get the result of the tournament
-     * @return The status of the game and the winning claim
+     * @notice Find the winning challenger
+     * @return The address of the winning challenger
      */
-    function result() external view override returns (GameStatus, bytes32) {
-        if (_status == GameStatus.IN_PROGRESS) {
-            return (_status, bytes32(0));
-        }
-
-        // Find the ultimate winner
-        uint256 winnerIndex = 0;
-        for (uint256 i = 0; i < _matches.length; i++) {
-            if (_matches[i].nodeIndex1 == winnerIndex || _matches[i].nodeIndex2 == winnerIndex) {
-                winnerIndex = _matches[i].winner;
+    function findWinningChallenger() internal view returns (address) {
+        // In a tournament, the winner is the participant of the final match winner
+        if (matches.length > 0) {
+            Match storage finalMatch = matches[matches.length - 1];
+            if (finalMatch.resolved) {
+                return nodes[finalMatch.winner].participant;
             }
         }
 
-        return (_status, _nodes[winnerIndex].claim);
+        // Fallback to the first challenger if no matches were played
+        return nodes.length > 1 ? nodes[1].participant : address(0);
     }
 
     /**
-     * @notice Resolve the dispute game
-     * @return The status of the game after resolution
+     * @notice Create matches for a new round when the number of participants is a power of 2
      */
-    function resolve() external override returns (GameStatus) {
-        require(_status == GameStatus.IN_PROGRESS, "Game not in progress");
+    function createMatchesForNewRound() internal {
+        // Clear previous matches
+        delete matches;
 
-        // Check if challenge period has passed for all matches
-        bool canResolve = true;
-        for (uint256 i = 0; i < _matches.length; i++) {
-            if (_matches[i].winner == 0 && block.timestamp <= _matches[i].deadline) {
-                canResolve = false;
-                break;
-            }
+        // Create matches for the current round
+        for (uint256 i = 0; i < totalParticipants; i += 2) {
+            uint256 matchIndex = matches.length;
+            matches.push(Match({
+                nodeA: i,
+                nodeB: i + 1,
+                winner: 0,
+                startTime: block.timestamp,
+                resolved: false
+            }));
+
+            emit MatchCreated(matchIndex, i, i + 1);
         }
-
-        require(canResolve, "Cannot resolve yet");
-
-        // Resolve all unresolved matches
-        for (uint256 i = 0; i < _matches.length; i++) {
-            if (_matches[i].winner == 0) {
-                _matches[i].winner = _matches[i].nodeIndex1; // Default to defender
-                emit MatchResolved(i, _matches[i].nodeIndex1);
-            }
-        }
-
-        // Determine game status
-        _status = GameStatus.DEFENDER_WINS; // Default to defender wins
-
-        // Emit tournament resolved event
-        emit TournamentResolved(_status, _nodes[0].claim);
-
-        // Distribute bonds
-        distributeBonds();
-
-        return _status;
     }
 
     /**
-     * @notice Get the current status of the game
-     * @return The current game status
+     * @notice Create matches for the next round based on winners of the current round
+     */
+    function createMatchesForNextRound() internal {
+        uint256[] memory winners = new uint256[](matches.length);
+
+        // Collect winners from the current round
+        for (uint256 i = 0; i < matches.length; i++) {
+            winners[i] = matches[i].winner;
+        }
+
+        // Clear previous matches
+        delete matches;
+
+        // Create new matches with winners
+        for (uint256 i = 0; i < winners.length; i += 2) {
+            if (i + 1 < winners.length) {
+                uint256 matchIndex = matches.length;
+                matches.push(Match({
+                    nodeA: winners[i],
+                    nodeB: winners[i + 1],
+                    winner: 0,
+                    startTime: block.timestamp,
+                    resolved: false
+                }));
+
+                emit MatchCreated(matchIndex, winners[i], winners[i + 1]);
+            }
+        }
+    }
+
+    /**
+     * @notice Determine the final winner of the tournament
+     * @return The final status of the game
+     */
+    function determineWinner() internal view returns (GameStatus) {
+        if (matches.length == 0) {
+            // No matches played, defender wins by default
+            return GameStatus.DEFENDER_WINS;
+        }
+
+        // Get the final match
+        Match storage finalMatch = matches[matches.length - 1];
+
+        // If the winner is the root node (defender), defender wins
+        if (finalMatch.winner == 0) {
+            return GameStatus.DEFENDER_WINS;
+        }
+
+        // Otherwise, challenger wins
+        return GameStatus.CHALLENGER_WINS;
+    }
+
+    /**
+     * @notice Check if a number is a power of 2
+     * @param x The number to check
+     * @return True if the number is a power of 2, false otherwise
+     */
+    function isPowerOfTwo(uint256 x) internal pure returns (bool) {
+        return x > 0 && (x & (x - 1)) == 0;
+    }
+
+    /// Methods below this comment when integrating has to be commented since
+    /// they're overiding existing methods
+
+    /**
+     * @notice Returns the timestamp when the dispute game was created
+     * @return The timestamp when the dispute game was created
+     */
+    function createdAt() external view override returns (uint256) {
+        return _createdAt;
+    }
+
+    /**
+     * @notice Returns the timestamp when the dispute game was resolved
+     * @return The timestamp when the dispute game was resolved
+     */
+    function resolvedAt() external view override returns (uint256) {
+        return _resolvedAt;
+    }
+
+    /**
+     * @notice Returns the current status of the dispute game
+     * @return The current status of the dispute game
      */
     function status() external view override returns (GameStatus) {
         return _status;
     }
 
     /**
-     * @notice Get the L2 block number associated with this dispute
-     * @return The L2 block number
+     * @notice Returns the type of the dispute game
+     * @return The type of the dispute game (3 for DAVE Tournament)
      */
-    function l2BlockNumber() external view override returns (uint256) {
-        return _l2BlockNumber;
+    function gameType() external pure override returns (uint8) {
+        return GAME_TYPE;
     }
 
     /**
-     * @notice Get the number of nodes in the tournament
-     * @return The number of nodes
+     * @notice Returns the address that created the dispute game
+     * @return The address that created the dispute game
      */
-    function getNodeCount() external view override returns (uint256) {
-        return _nodes.length;
+    function gameCreator() external view override returns (address) {
+        return _gameCreator;
     }
 
     /**
-     * @notice Get a node by index
-     * @param index The index of the node
-     * @return The node
+     * @notice Returns the root claim of the dispute game
+     * @return The root claim of the dispute game
      */
-    function getNode(uint256 index) external view override returns (Node memory) {
-        require(index < _nodes.length, "Invalid node index");
-        return _nodes[index];
+    function rootClaim() external view override returns (bytes32) {
+        return _rootClaim;
     }
 
     /**
-     * @notice Get the number of matches in the tournament
-     * @return The number of matches
+     * @notice Returns the L1 head hash at the time the dispute game was created
+     * @return The L1 head hash at the time the dispute game was created
      */
-    function getMatchCount() external view override returns (uint256) {
-        return _matches.length;
+    function l1Head() external view override returns (bytes32) {
+        return _l1Head;
     }
 
     /**
-     * @notice Get a match by index
-     * @param index The index of the match
-     * @return The match
+     * @notice Returns extra data supplied to the dispute game
+     * @return Extra data supplied to the dispute game
      */
-    function getMatch(uint256 index) external view override returns (Match memory) {
-        require(index < _matches.length, "Invalid match index");
-        return _matches[index];
+    function extraData() external view override returns (bytes memory) {
+        return _extraData;
+    }
+
+    /**
+     * @notice Returns the game type, root claim, and extra data
+     * @return The game type, root claim, and extra data
+     */
+    function gameData() external view override returns (uint8, bytes32, bytes memory) {
+        return (GAME_TYPE, _rootClaim, _extraData);
+    }
+
+    /**
+     * @notice Resolves the dispute game
+     * @return The status of the game after resolution
+     */
+    function resolve() external override returns (GameStatus) {
+        if (_status != GameStatus.IN_PROGRESS) {
+            return _status;
+        }
+
+        // If all matches are resolved, determine the winner
+        bool allMatchesResolved = true;
+        for (uint256 i = 0; i < matches.length; i++) {
+            if (!matches[i].resolved) {
+                allMatchesResolved = false;
+                break;
+            }
+        }
+
+        if (allMatchesResolved) {
+            _resolvedAt = block.timestamp;
+            _status = determineWinner();
+            emit Resolved(_status);
+        }
+
+        return _status;
     }
 }
