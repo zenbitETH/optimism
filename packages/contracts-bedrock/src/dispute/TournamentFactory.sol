@@ -6,16 +6,15 @@ import { TournamentGame } from "./TournamentGame.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Address } from "@openzeppelin/contracts/utils/Address.sol";
 import { Create2 } from "@openzeppelin/contracts/utils/Create2.sol";
-import { Semver } from "../universal/Semver.sol";
-import { Clone } from "../libraries/Clone.sol";
-
+import { ISemver } from "interfaces/universal/ISemver.sol";
+import { Clone } from "@solady/utils/Clone.sol";
 /**
  * @title TournamentFactory
  * @notice Factory contract for creating and managing tournament-based dispute games
  * @dev This contract follows the factory pattern used in the OP Stack for creating dispute games
  *      It creates new tournament instances and registers them with the DisputeGameFactory
  */
-contract TournamentFactory is Ownable, Semver {
+contract TournamentFactory is Ownable, ISemver {
     /**
      * @notice Implementation of the TournamentGame contract
      * @dev This is the base contract that will be cloned for each new tournament

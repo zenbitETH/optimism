@@ -3,7 +3,7 @@ pragma solidity ^0.8.15;
 
 import { ITournamentGame } from "interfaces/dispute/ITournamentGame.sol";
 import { IDisputeGameDAVE } from "interfaces/dispute/IDisputeGameDAVE.sol";
-import { GameStatus } from "src/dispute/lib/GameTypes.sol";
+import "src/dispute/lib/GameTypes.sol";
 
 /**
  * @title Tournament Contract for Cartesi DAVE Fraud Proofs
@@ -39,7 +39,7 @@ contract Tournament is IDisputeGameDAVE {
     bytes private _extraData;
     uint256 private immutable _createdAt;
     uint256 private _resolvedAt;
-    GameStatus private _status;
+    GameTypes.GameStatus private _status;
 
     // Tournament specific variables
     Node[] public nodes;
@@ -81,7 +81,7 @@ contract Tournament is IDisputeGameDAVE {
         _gameCreator = msg.sender;
         _extraData = initialExtraData;
         _createdAt = block.timestamp;
-        _status = GameStatus.IN_PROGRESS;
+        _status = GameTypes.GameStatus.IN_PROGRESS;
 
         // Initialize the tournament with the root node (defender)
         nodes.push(Node({
@@ -103,7 +103,7 @@ contract Tournament is IDisputeGameDAVE {
      * @param claim The counter-claim being made
      */
     function joinTournament(bytes32 claim) external payable {
-        if (_status != GameStatus.IN_PROGRESS) revert TournamentAlreadyResolved();
+        if (_status != GameTypes.GameStatus.IN_PROGRESS) revert TournamentAlreadyResolved();
         if (msg.sender == address(0)) revert InvalidParticipant();
         if (msg.value < BOND_AMOUNT) revert InsufficientBond();
         if (hasParticipated[msg.sender]) revert AlreadyParticipated();
@@ -133,7 +133,7 @@ contract Tournament is IDisputeGameDAVE {
      * @param winnerIndex The index of the winning node
      */
     function resolveMatch(uint256 matchIndex, uint256 winnerIndex) external {
-        if (_status != GameStatus.IN_PROGRESS) revert TournamentAlreadyResolved();
+        if (_status != GameTypes.GameStatus.IN_PROGRESS) revert TournamentAlreadyResolved();
         if (matchIndex >= matches.length) revert MatchNotStarted();
 
         Match storage currentMatch = matches[matchIndex];
@@ -187,11 +187,11 @@ contract Tournament is IDisputeGameDAVE {
      * @notice Claim the bond as the tournament winner
      */
     function claimBond() external {
-        if (_status == GameStatus.IN_PROGRESS) revert TournamentNotResolved();
+        if (_status == GameTypes.GameStatus.IN_PROGRESS) revert TournamentNotResolved();
 
         // Determine the winner address based on the final status
         address winner;
-        if (_status == GameStatus.DEFENDER_WINS) {
+        if (_status == GameTypes.GameStatus.DEFENDER_WINS) {
             winner = nodes[0].participant; // Root claim defender
         } else {
             // Find the challenger who won
@@ -286,10 +286,10 @@ contract Tournament is IDisputeGameDAVE {
      * @notice Determine the final winner of the tournament
      * @return The final status of the game
      */
-    function determineWinner() internal view returns (GameStatus) {
+    function determineWinner() internal view returns (GameTypes.GameStatus _gameStatus) {
         if (matches.length == 0) {
             // No matches played, defender wins by default
-            return GameStatus.DEFENDER_WINS;
+            return GameTypes.GameStatus.DEFENDER_WINS;
         }
 
         // Get the final match
@@ -297,11 +297,11 @@ contract Tournament is IDisputeGameDAVE {
 
         // If the winner is the root node (defender), defender wins
         if (finalMatch.winner == 0) {
-            return GameStatus.DEFENDER_WINS;
+            return GameTypes.GameStatus.DEFENDER_WINS;
         }
 
         // Otherwise, challenger wins
-        return GameStatus.CHALLENGER_WINS;
+        return GameTypes.GameStatus.CHALLENGER_WINS;
     }
 
     /**
@@ -320,98 +320,98 @@ contract Tournament is IDisputeGameDAVE {
      * @notice Returns the timestamp when the dispute game was created
      * @return The timestamp when the dispute game was created
      */
-    function createdAt() external view override returns (uint256) {
-        return _createdAt;
-    }
+    // function createdAt() external view override returns (uint256) {
+    //     return _createdAt;
+    // }
 
-    /**
-     * @notice Returns the timestamp when the dispute game was resolved
-     * @return The timestamp when the dispute game was resolved
-     */
-    function resolvedAt() external view override returns (uint256) {
-        return _resolvedAt;
-    }
+    // /**
+    //  * @notice Returns the timestamp when the dispute game was resolved
+    //  * @return The timestamp when the dispute game was resolved
+    //  */
+    // function resolvedAt() external view override returns (uint256) {
+    //     return _resolvedAt;
+    // }
 
-    /**
-     * @notice Returns the current status of the dispute game
-     * @return The current status of the dispute game
-     */
-    function status() external view override returns (GameStatus) {
-        return _status;
-    }
+    // /**
+    //  * @notice Returns the current status of the dispute game
+    //  * @return The current status of the dispute game
+    //  */
+    // function status() external view override returns (GameTypes.GameStatus) {
+    //     return _status;
+    // }
 
-    /**
-     * @notice Returns the type of the dispute game
-     * @return The type of the dispute game (3 for DAVE Tournament)
-     */
-    function gameType() external pure override returns (uint8) {
-        return GAME_TYPE;
-    }
+    // /**
+    //  * @notice Returns the type of the dispute game
+    //  * @return The type of the dispute game (3 for DAVE Tournament)
+    //  */
+    // function gameType() external pure override returns (uint8) {
+    //     return GAME_TYPE;
+    // }
 
-    /**
-     * @notice Returns the address that created the dispute game
-     * @return The address that created the dispute game
-     */
-    function gameCreator() external view override returns (address) {
-        return _gameCreator;
-    }
+    // /**
+    //  * @notice Returns the address that created the dispute game
+    //  * @return The address that created the dispute game
+    //  */
+    // function gameCreator() external view override returns (address) {
+    //     return _gameCreator;
+    // }
 
-    /**
-     * @notice Returns the root claim of the dispute game
-     * @return The root claim of the dispute game
-     */
-    function rootClaim() external view override returns (bytes32) {
-        return _rootClaim;
-    }
+    // /**
+    //  * @notice Returns the root claim of the dispute game
+    //  * @return The root claim of the dispute game
+    //  */
+    // function rootClaim() external view override returns (bytes32) {
+    //     return _rootClaim;
+    // }
 
-    /**
-     * @notice Returns the L1 head hash at the time the dispute game was created
-     * @return The L1 head hash at the time the dispute game was created
-     */
-    function l1Head() external view override returns (bytes32) {
-        return _l1Head;
-    }
+    // /**
+    //  * @notice Returns the L1 head hash at the time the dispute game was created
+    //  * @return The L1 head hash at the time the dispute game was created
+    //  */
+    // function l1Head() external view override returns (bytes32) {
+    //     return _l1Head;
+    // }
 
-    /**
-     * @notice Returns extra data supplied to the dispute game
-     * @return Extra data supplied to the dispute game
-     */
-    function extraData() external view override returns (bytes memory) {
-        return _extraData;
-    }
+    // /**
+    //  * @notice Returns extra data supplied to the dispute game
+    //  * @return Extra data supplied to the dispute game
+    //  */
+    // function extraData() external view override returns (bytes memory) {
+    //     return _extraData;
+    // }
 
-    /**
-     * @notice Returns the game type, root claim, and extra data
-     * @return The game type, root claim, and extra data
-     */
-    function gameData() external view override returns (uint8, bytes32, bytes memory) {
-        return (GAME_TYPE, _rootClaim, _extraData);
-    }
+    // /**
+    //  * @notice Returns the game type, root claim, and extra data
+    //  * @return The game type, root claim, and extra data
+    //  */
+    // function gameData() external view override returns (uint8, bytes32, bytes memory) {
+    //     return (GAME_TYPE, _rootClaim, _extraData);
+    // }
 
-    /**
-     * @notice Resolves the dispute game
-     * @return The status of the game after resolution
-     */
-    function resolve() external override returns (GameStatus) {
-        if (_status != GameStatus.IN_PROGRESS) {
-            return _status;
-        }
+    // /**
+    //  * @notice Resolves the dispute game
+    //  * @return The status of the game after resolution
+    //  */
+    // function resolve() external override returns (GameTypes.GameStatus) {
+    //     if (_status != GameTypes.GameStatus.IN_PROGRESS) {
+    //         return _status;
+    //     }
 
-        // If all matches are resolved, determine the winner
-        bool allMatchesResolved = true;
-        for (uint256 i = 0; i < matches.length; i++) {
-            if (!matches[i].resolved) {
-                allMatchesResolved = false;
-                break;
-            }
-        }
+    //     // If all matches are resolved, determine the winner
+    //     bool allMatchesResolved = true;
+    //     for (uint256 i = 0; i < matches.length; i++) {
+    //         if (!matches[i].resolved) {
+    //             allMatchesResolved = false;
+    //             break;
+    //         }
+    //     }
 
-        if (allMatchesResolved) {
-            _resolvedAt = block.timestamp;
-            _status = determineWinner();
-            emit Resolved(_status);
-        }
+    //     if (allMatchesResolved) {
+    //         _resolvedAt = block.timestamp;
+    //         _status = determineWinner();
+    //         emit Resolved(_status);
+    //     }
 
-        return _status;
-    }
+    //     return _status;
+    // }
 }

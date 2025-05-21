@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.15;
 
-import { ITournamentGame } from "../../interfaces/dispute/ITournamentGame.sol";
+import { ITournamentGame } from "interfaces/dispute/ITournamentGame.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import { Address } from "@openzeppelin/contracts/utils/Address.sol";
+import "src/dispute/lib/Types.sol";
 
 /**
  * @title TournamentGame
@@ -38,7 +39,7 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
     /**
      * @notice Current status of the dispute game
      */
-    GameStatus private _status;
+    GameStatus private _gameStatus;
 
     /**
      * @notice Address that created the dispute game
@@ -147,7 +148,7 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
         _l1Head = l1Head;
         _extraData = extraData;
         _createdAt = block.timestamp;
-        _status = GameStatus.IN_PROGRESS;
+        _gameStatus = GameStatus.IN_PROGRESS;
         _currentRound = 0;
         _roundStartTimes[0] = block.timestamp;
 
@@ -260,13 +261,13 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
      */
     function claimBond() external tournamentResolved nonReentrant {
         // Ensure the tournament has a winner
-        if (_status != GameStatus.CHALLENGER_WINS && _status != GameStatus.DEFENDER_WINS) {
+        if (_gameStatus != GameStatus.CHALLENGER_WINS && _gameStatus != GameStatus.DEFENDER_WINS) {
             revert TournamentNotResolved();
         }
 
         // Determine the winner address
         address winner;
-        if (_status == GameStatus.DEFENDER_WINS) {
+        if (_gameStatus == GameStatus.DEFENDER_WINS) {
             winner = _gameCreator;
         } else {
             // Find the challenger who won
@@ -313,9 +314,9 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
 
     /**
      * @notice Resolves the dispute game
-     * @return The status of the game after resolution
+     * @return GameStatus_ The status of the game after resolution
      */
-    function resolve() external tournamentNotResolved nonReentrant returns (GameStatus) {
+    function resolve() external tournamentNotResolved nonReentrant returns (GameStatus GameStatus_) {
         // Check if all matches are resolved
         for (uint256 i = 0; i < _matches.length; i++) {
             if (!_matches[i].resolved) {
@@ -329,7 +330,7 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
                     emit MatchResolved(i, _matches[i].nodeA);
                 } else {
                     // If the match has not timed out, the tournament cannot be resolved yet
-                    return _status;
+                    return _gameStatus;
                 }
             }
         }
@@ -348,11 +349,11 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
         }
 
         // Set the status and resolved timestamp
-        _status = defenderWins ? GameStatus.DEFENDER_WINS : GameStatus.CHALLENGER_WINS;
+        _gameStatus = defenderWins ? GameStatus.DEFENDER_WINS : GameStatus.CHALLENGER_WINS;
         _resolvedAt = block.timestamp;
 
-        emit Resolved(_status);
-        return _status;
+        emit Resolved(_gameStatus);
+        return _gameStatus;
     }
 
     /**
@@ -430,7 +431,7 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
      * @return The current status of the dispute game
      */
     function status() external view returns (GameStatus) {
-        return _status;
+        return _gameStatus;
     }
 
     /**
@@ -477,8 +478,8 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
      * @notice Returns the game type, root claim, and extra data
      * @return The game type, root claim, and extra data
      */
-    function gameData() external view returns (uint8, bytes32, bytes memory) {
-        return (gameType(), _rootClaim, _extraData);
+    function gameData() external view returns (GameStatus, bytes32, bytes memory) {
+        return (GameStatus, _rootClaim, _extraData);
     }
 
     /**
@@ -565,10 +566,10 @@ contract TournamentGame is ITournamentGame, Initializable, ReentrancyGuard {
             }
 
             // Set the status and resolved timestamp
-            _status = defenderWins ? GameStatus.DEFENDER_WINS : GameStatus.CHALLENGER_WINS;
+            _gameStatus = defenderWins ? GameStatus.DEFENDER_WINS : GameStatus.CHALLENGER_WINS;
             _resolvedAt = block.timestamp;
 
-            emit Resolved(_status);
+            emit Resolved(_gameStatus);
         }
     }
 
