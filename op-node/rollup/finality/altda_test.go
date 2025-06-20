@@ -14,8 +14,8 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/rollup"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/engine"
-	"github.com/ethereum-optimism/optimism/op-node/rollup/event"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/event"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum-optimism/optimism/op-service/testutils"
 )
@@ -70,7 +70,7 @@ func TestAltDAFinalityData(t *testing.T) {
 		DAChallengeWindow: 90,
 		DAResolveWindow:   90,
 	}
-	// shoud return l1 finality if altda is not enabled
+	// should return l1 finality if altda is not enabled
 	require.Equal(t, uint64(defaultFinalityLookback), calcFinalityLookback(cfg))
 
 	cfg.AltDAConfig = altDACfg
@@ -155,7 +155,7 @@ func TestAltDAFinalityData(t *testing.T) {
 		altdaFinalization := commitmentInclusionFinalized.Number + cfg.AltDAConfig.DAChallengeWindow
 		if commitmentInclusionFinalized != (eth.L1BlockRef{}) && l1parent.Number == altdaFinalization {
 			// When the signal is forwarded, a finalization attempt will be scheduled
-			emitter.ExpectOnce(TryFinalizeEvent{})
+			emitter.ExpectOnce(TryFinalizeEvent{Ctx: event.WrapCtx(fi.ctx)})
 			altDABackend.forwardTo(commitmentInclusionFinalized)
 			emitter.AssertExpectations(t)
 			require.Equal(t, commitmentInclusionFinalized, fi.finalizedL1, "finality signal now made its way in regular finalizer")

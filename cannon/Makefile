@@ -24,13 +24,14 @@ cannon64-impl:
 	env GO111MODULE=on GOOS=$(TARGETOS) GOARCH=$(TARGETARCH) go build -v $(LDFLAGS) -o ./bin/cannon64-impl .
 
 # Note: This target is used by ./scripts/build-legacy-cannons.sh
-# It should build the individual versions of cannons and copy them into place in hte multicannon/embeds directory
+# It should build the individual versions of cannons and copy them into place in the multicannon/embeds directory
 # Ideally, preserve backwards compatibility with this behaviour but if it needs to change, build-legacy-cannons.sh will
 # need to be updated to account for different behaviours in different versions.
 # Each embed is suffixed with the latest `StateVersion` number corresponding to the target VM and architecture.
 cannon-embeds: cannon64-impl
 	# 64-bit multithreaded vm
 	@cp bin/cannon64-impl ./multicannon/embeds/cannon-7
+	@cp bin/cannon64-impl ./multicannon/embeds/cannon-8
 
 cannon: cannon-embeds
 	env GO111MODULE=on GOOS=$(TARGETOS) GOARCH=$(TARGETARCH) go build -v $(LDFLAGS) -o ./bin/cannon ./multicannon/
@@ -38,9 +39,10 @@ cannon: cannon-embeds
 clean:
 	rm -rf bin multicannon/embeds/cannon*
 
-elf: elf-go-123
+elf:
+	make -C ./testdata elf
 
-elf-go-123:
+elf-go-current:
 	make -C ./testdata/go-1-23 elf
 
 sanitize-program:
@@ -59,7 +61,7 @@ test: elf contract
 	go test -v ./...
 
 
-diff-%-cannon: cannon elf
+diff-%-cannon: cannon elf-go-current
 	# Load an elf file to create a prestate, and check that both cannon versions generate the same prestate
 	@VM=$*; \
 	echo "Running diff for VM type $${VM}"; \
@@ -109,7 +111,7 @@ fuzz:
 	cannon \
 	clean \
 	elf \
-	elf-go-123 \
+	elf-go-current \
 	test \
 	lint \
 	fuzz \

@@ -1,12 +1,43 @@
 package stack
 
+import (
+	"log/slog"
+
+	"github.com/ethereum-optimism/optimism/op-service/eth"
+)
+
 // L2ChallengerID identifies a L2Challenger by name and chainID, is type-safe, and can be value-copied and used as map key.
 type L2ChallengerID idWithChain
 
+var _ IDWithChain = (*L2ChallengerID)(nil)
+
 const L2ChallengerKind Kind = "L2Challenger"
+
+func NewL2ChallengerID(key string, chainID eth.ChainID) L2ChallengerID {
+	return L2ChallengerID{
+		key:     key,
+		chainID: chainID,
+	}
+}
 
 func (id L2ChallengerID) String() string {
 	return idWithChain(id).string(L2ChallengerKind)
+}
+
+func (id L2ChallengerID) ChainID() eth.ChainID {
+	return idWithChain(id).chainID
+}
+
+func (id L2ChallengerID) Kind() Kind {
+	return L2ChallengerKind
+}
+
+func (id L2ChallengerID) Key() string {
+	return id.key
+}
+
+func (id L2ChallengerID) LogValue() slog.Value {
+	return slog.StringValue(id.String())
 }
 
 func (id L2ChallengerID) MarshalText() ([]byte, error) {

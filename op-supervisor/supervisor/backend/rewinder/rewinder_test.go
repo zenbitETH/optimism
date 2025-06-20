@@ -12,8 +12,8 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethereum-optimism/optimism/op-node/rollup/event"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/event"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum-optimism/optimism/op-supervisor/metrics"
 	"github.com/ethereum-optimism/optimism/op-supervisor/supervisor/backend/db"
@@ -1425,12 +1425,8 @@ func setupTestChains(t *testing.T, chainIDs ...eth.ChainID) *testSetup {
 
 	// Create dependency set for all chains
 	deps := make(map[eth.ChainID]*depset.StaticConfigDependency)
-	for i, chainID := range chainIDs {
-		deps[chainID] = &depset.StaticConfigDependency{
-			ChainIndex:     types.ChainIndex(i + 1),
-			ActivationTime: 42,
-			HistoryMinTime: 100,
-		}
+	for _, chainID := range chainIDs {
+		deps[chainID] = &depset.StaticConfigDependency{}
 	}
 	depSet, err := depset.NewStaticConfigDependencySet(deps)
 	require.NoError(t, err)

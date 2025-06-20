@@ -10,9 +10,9 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 
-	"github.com/ethereum-optimism/optimism/op-node/rollup/event"
 	"github.com/ethereum-optimism/optimism/op-service/cliapp"
 	"github.com/ethereum-optimism/optimism/op-service/clock"
+	"github.com/ethereum-optimism/optimism/op-service/event"
 	"github.com/ethereum-optimism/optimism/op-service/httputil"
 	opmetrics "github.com/ethereum-optimism/optimism/op-service/metrics"
 	"github.com/ethereum-optimism/optimism/op-service/oppprof"
@@ -186,11 +186,11 @@ func (su *SupervisorService) initDBSync(ctx context.Context, cfg *config.Config)
 		DataDir: cfg.Datadir,
 		Logger:  su.log,
 	}
-	depSet, err := cfg.DependencySetSource.LoadDependencySet(ctx)
+	cfgSet, err := cfg.FullConfigSetSource.LoadFullConfigSet(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to load dependency set: %w", err)
+		return fmt.Errorf("failed to load full config set: %w", err)
 	}
-	handler, err := sync.NewServer(syncCfg, depSet.Chains())
+	handler, err := sync.NewServer(syncCfg, cfgSet.Chains())
 	if err != nil {
 		return fmt.Errorf("failed to create db sync handler: %w", err)
 	}

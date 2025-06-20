@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/sources/batching"
 )
 
 type ChainID interface {
@@ -109,6 +110,9 @@ type TransactionSender interface {
 type EthNonce interface {
 	// PendingNonceAt returns the account nonce of the given account in the pending state.
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
+	// NonceAt returns the account nonce of the given account in the state at the given block number.
+	// A nil block number may be used to get the latest state.
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
 }
 
 type EthBalance interface {
@@ -118,6 +122,10 @@ type EthBalance interface {
 
 type EthCode interface {
 	CodeAtHash(ctx context.Context, account common.Address, blockHash common.Hash) ([]byte, error)
+}
+
+type EthMultiCaller interface {
+	NewMultiCaller(batchSize int) *batching.MultiCaller
 }
 
 type EthClient interface {
@@ -134,6 +142,7 @@ type EthClient interface {
 	EthNonce
 	EthBalance
 	EthCode
+	EthMultiCaller
 }
 
 type EthExtendedClient interface {

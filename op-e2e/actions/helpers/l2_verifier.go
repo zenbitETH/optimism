@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 
+	"github.com/ethereum-optimism/optimism/op-supervisor/supervisor/backend/depset"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
 
@@ -23,7 +24,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/rollup/derive"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/driver"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/engine"
-	"github.com/ethereum-optimism/optimism/op-node/rollup/event"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/finality"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/interop"
 	"github.com/ethereum-optimism/optimism/op-node/rollup/interop/managed"
@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-node/rollup/sync"
 	"github.com/ethereum-optimism/optimism/op-service/client"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/event"
 	opmetrics "github.com/ethereum-optimism/optimism/op-service/metrics"
 	"github.com/ethereum-optimism/optimism/op-service/safego"
 	"github.com/ethereum-optimism/optimism/op-service/sources"
@@ -108,7 +109,7 @@ type safeDB interface {
 
 func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 	blobsSrc derive.L1BlobsFetcher, altDASrc driver.AltDAIface,
-	eng L2API, cfg *rollup.Config, syncCfg *sync.Config, safeHeadListener safeDB,
+	eng L2API, cfg *rollup.Config, depSet depset.DependencySet, syncCfg *sync.Config, safeHeadListener safeDB,
 ) *L2Verifier {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -129,7 +130,9 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 
 	var interopSys interop.SubSystem
 	if cfg.InteropTime != nil {
-		interopSys = managed.NewManagedMode(log, cfg, "127.0.0.1", 0, interopJWTSecret, l1, eng, &opmetrics.NoopRPCMetrics{})
+		mm := managed.NewManagedMode(log, cfg, "127.0.0.1", 0, interopJWTSecret, l1, eng, &opmetrics.NoopRPCMetrics{})
+		mm.TestDisableEventDeduplication()
+		interopSys = mm
 		sys.Register("interop", interopSys, opts)
 		require.NoError(t, interopSys.Start(context.Background()))
 		t.Cleanup(func() {
@@ -159,7 +162,7 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 		attributes.NewAttributesHandler(log, cfg, ctx, eng), opts)
 
 	managedMode := interopSys != nil
-	pipeline := derive.NewDerivationPipeline(log, cfg, l1, blobsSrc, altDASrc, eng, metrics, managedMode)
+	pipeline := derive.NewDerivationPipeline(log, cfg, depSet, l1, blobsSrc, altDASrc, eng, metrics, managedMode)
 	sys.Register("pipeline", derive.NewPipelineDeriver(ctx, pipeline), opts)
 
 	testActionEmitter := sys.Register("test-action", nil, opts)
@@ -211,7 +214,7 @@ func NewL2Verifier(t Testing, log log.Logger, l1 derive.L1Fetcher,
 	apis := []rpc.API{
 		{
 			Namespace:     "optimism",
-			Service:       node.NewNodeAPI(cfg, eng, backend, safeHeadListener, log),
+			Service:       node.NewNodeAPI(cfg, depSet, eng, backend, safeHeadListener, log),
 			Public:        true,
 			Authenticated: false,
 		},
@@ -351,7 +354,7 @@ func (s *L2Verifier) ActRPCFail(t Testing) {
 func (s *L2Verifier) ActL1HeadSignal(t Testing) {
 	head, err := s.l1.L1BlockRefByLabel(t.Ctx(), eth.Unsafe)
 	require.NoError(t, err)
-	s.synchronousEvents.Emit(status.L1UnsafeEvent{L1Unsafe: head})
+	s.synchronousEvents.Emit(status.L1UnsafeEvent{L1Unsafe: head, Ctx: event.WrapCtx(t.Ctx())})
 	require.NoError(t, s.drainer.DrainUntil(func(ev event.Event) bool {
 		x, ok := ev.(status.L1UnsafeEvent)
 		return ok && x.L1Unsafe == head
@@ -362,7 +365,7 @@ func (s *L2Verifier) ActL1HeadSignal(t Testing) {
 func (s *L2Verifier) ActL1SafeSignal(t Testing) {
 	safe, err := s.l1.L1BlockRefByLabel(t.Ctx(), eth.Safe)
 	require.NoError(t, err)
-	s.synchronousEvents.Emit(status.L1SafeEvent{L1Safe: safe})
+	s.synchronousEvents.Emit(status.L1SafeEvent{L1Safe: safe, Ctx: event.WrapCtx(t.Ctx())})
 	require.NoError(t, s.drainer.DrainUntil(func(ev event.Event) bool {
 		x, ok := ev.(status.L1SafeEvent)
 		return ok && x.L1Safe == safe
@@ -373,7 +376,7 @@ func (s *L2Verifier) ActL1SafeSignal(t Testing) {
 func (s *L2Verifier) ActL1FinalizedSignal(t Testing) {
 	finalized, err := s.l1.L1BlockRefByLabel(t.Ctx(), eth.Finalized)
 	require.NoError(t, err)
-	s.synchronousEvents.Emit(finality.FinalizeL1Event{FinalizedL1: finalized})
+	s.synchronousEvents.Emit(finality.FinalizeL1Event{FinalizedL1: finalized, Ctx: event.WrapCtx(t.Ctx())})
 	require.NoError(t, s.drainer.DrainUntil(func(ev event.Event) bool {
 		x, ok := ev.(finality.FinalizeL1Event)
 		return ok && x.FinalizedL1 == finalized
@@ -399,7 +402,7 @@ func (s *L2Verifier) OnEvent(ev event.Event) bool {
 	case derive.PipelineStepEvent:
 		s.L2PipelineIdle = false
 	case driver.StepReqEvent:
-		s.synchronousEvents.Emit(driver.StepEvent{})
+		s.synchronousEvents.Emit(driver.StepEvent{Ctx: x.Ctx})
 	default:
 		return false
 	}
@@ -425,21 +428,21 @@ func (s *L2Verifier) ActL2EventsUntil(t Testing, fn func(ev event.Event) bool, m
 			return
 		}
 		if err == io.EOF {
-			s.synchronousEvents.Emit(driver.StepEvent{})
+			s.synchronousEvents.Emit(driver.StepEvent{Ctx: event.WrapCtx(t.Ctx())})
 		}
 	}
 	t.Fatalf("event condition did not hit, ran maximum number of steps: %d", max)
 }
 
 func (s *L2Verifier) ActL2PipelineFull(t Testing) {
-	s.synchronousEvents.Emit(driver.StepEvent{})
+	s.synchronousEvents.Emit(driver.StepEvent{Ctx: event.WrapCtx(t.Ctx())})
 	require.NoError(t, s.drainer.Drain(), "complete all event processing triggered by deriver step")
 }
 
 // ActL2UnsafeGossipReceive creates an action that can receive an unsafe execution payload, like gossipsub
 func (s *L2Verifier) ActL2UnsafeGossipReceive(payload *eth.ExecutionPayloadEnvelope) Action {
 	return func(t Testing) {
-		s.synchronousEvents.Emit(clsync.ReceivedUnsafePayloadEvent{Envelope: payload})
+		s.synchronousEvents.Emit(clsync.ReceivedUnsafePayloadEvent{Envelope: payload, Ctx: event.WrapCtx(t.Ctx())})
 	}
 }
 
